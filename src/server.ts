@@ -236,7 +236,7 @@ export async function buildContext(
     scholar,
     fetcher,
     logger,
-    remoteCaller: perUser || config.oauth.enabled,
+    remoteCaller: perUser || config.oauth.enabled || config.confine,
     zoteroUserId: overrides.zoteroUserId,
     metrics,
     usage,

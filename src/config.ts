@@ -121,6 +121,14 @@ export interface ZoteusConfig {
   logFile?: string;
   /** Daily check against GitHub releases for a newer version (surfaced via zotero_whoami). */
   updateCheck: boolean;
+  /**
+   * Treat a stdio caller as a remote one (ZOTEUS_CONFINE): caller-supplied file paths are held
+   * to the data directory and `url` downloads go through the public-HTTPS-only fetch, exactly as
+   * on a shared HTTP deployment. For an unattended agent whose tool calls may be steered by
+   * untrusted library content, so a path or URL argument cannot read the host's own secrets or
+   * loopback services into the library.
+   */
+  confine: boolean;
   /** Distribution channel marker (the .dxt manifest sets "dxt"); tailors the update notice. */
   dist?: string;
   allowInsecureHttp: boolean;
@@ -346,6 +354,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ZoteusConfig {
         ZOTEUS_LOG_FORMAT: z.enum(['text', 'json']).default('text'),
         ZOTEUS_LOG_FILE: z.string().min(1).optional(),
         ZOTEUS_UPDATE_CHECK: bool(false),
+        ZOTEUS_CONFINE: bool(false),
         ZOTEUS_DIST: z.string().min(1).optional(),
         ZOTEUS_ALLOW_INSECURE_HTTP: bool(false),
         ZOTEUS_METRICS_ENABLED: bool(false),
@@ -566,6 +575,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ZoteusConfig {
     logFormat: parsed.ZOTEUS_LOG_FORMAT,
     logFile: parsed.ZOTEUS_LOG_FILE,
     updateCheck: parsed.ZOTEUS_UPDATE_CHECK,
+    confine: parsed.ZOTEUS_CONFINE,
     dist: parsed.ZOTEUS_DIST,
     allowInsecureHttp: parsed.ZOTEUS_ALLOW_INSECURE_HTTP,
     metricsEnabled: parsed.ZOTEUS_METRICS_ENABLED,
