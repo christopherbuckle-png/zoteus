@@ -158,9 +158,9 @@ export class LibraryRouter {
    * Record a cloud write so that reads of that library stop being answered by a desktop app
    * that has not synced it yet.
    *
-   * The bug this closes: group writes always go to the cloud, and personal-library writes
-   * from zotero_create_items and zotero_update_item do too, while reads of both go to the
-   * desktop whenever it holds the library. Measured against a real Zotero 10 and a real
+   * The bug this closes: group writes all went to the cloud, and personal-library writes
+   * from zotero_create_items and zotero_update_item did too, while reads of both went to the
+   * desktop whenever it held the library. Measured against a real Zotero 10 and a real
    * cloud key, an item created in either library came back "Wrote 1 item(s)" with its key,
    * and the very next zotero_search_items found nothing and zotero_get_item answered
    * "Local API 404". An agent that verifies its own writes is told they did not happen, and
@@ -177,6 +177,14 @@ export class LibraryRouter {
    *
    * The entry is recorded synchronously, before the baseline is measured, because the entry
    * is what pins reads; a read arriving in the meantime must find it already there.
+   *
+   * Writes now go to the desktop for every library it holds, groups included, so an entry
+   * arises only when a cloud write had to happen anyway: the app was down or refused local
+   * writes, or a group the app does not hold (which `useLocal` never routes locally, so
+   * there the entry is inert). Desktop writes record nothing: reads of a library the app
+   * holds already go to it. While an entry stands, the write tools keep that library's
+   * writes on the cloud as well (`awaitingDesktopSync`), so reads and writes never split
+   * between a cloud that has the latest write and a desktop that does not.
    */
   noteCloudWrite(
     lib: LibraryRef,
@@ -201,6 +209,29 @@ export class LibraryRouter {
         // cannot distinguish a synced write from an existing item with stale fields.
         // A later write may replace this witness; otherwise it lasts for this process.
       });
+  }
+
+  /**
+   * Whether a read of `library` goes to the desktop app right now: the standing rule, then
+   * the pending-write override, exactly as every routed read here decides it. For a caller
+   * that reads through a client of its own (an attachment's file bytes) but must route the
+   * way the reads beside it do.
+   */
+  async readsLocally(library: LibraryRef): Promise<boolean> {
+    return this.route(library);
+  }
+
+  /**
+   * True when `library` is one the desktop serves, but a cloud write to it is still waiting
+   * for the desktop to sync, so its reads are being answered by the cloud. Write tools ask
+   * this before writing to the desktop (`desktopTakesWrites`) and keep the write on the
+   * cloud while it holds: the desktop copy is behind, and a write there would be invisible
+   * to the very reads that follow it. Costs nothing for a library nobody wrote to on the
+   * cloud, and clears the entry the moment the desktop is seen to hold the write, exactly as
+   * the next read would.
+   */
+  async awaitingDesktopSync(library: LibraryRef): Promise<boolean> {
+    return this.useLocal(library) && !(await this.route(library));
   }
 
   /**

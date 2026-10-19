@@ -230,37 +230,39 @@ export class AttachmentUploadError extends Error {
 }
 
 /**
- * Create an `imported_file` attachment under `parent` and store the bytes on it
- * (authorize -> POST bytes -> register). Returns the new attachment key; throws with a
- * human-readable reason when Zotero refuses the item or the upload.
+ * Create an `imported_file` attachment, under `parent` or standalone when there is none, and
+ * store the bytes on it (authorize -> POST bytes -> register), in `lib` (default: the
+ * personal library; a group must be one the desktop holds). Returns the new attachment key;
+ * throws with a human-readable reason when Zotero refuses the item or the upload.
  */
 export async function storeLocalAttachment(
   ctx: Pick<ToolContext, 'localWrites'>,
-  file: { parent: string; bytes: Uint8Array; filename: string; contentType: string; title?: string; url?: string },
+  file: { parent?: string; bytes: Uint8Array; filename: string; contentType: string; title?: string; url?: string },
+  lib?: LibraryRef,
 ): Promise<string> {
   if (!ctx.localWrites) throw new Error('Zotero desktop local-API writes are not available.');
   const item: Record<string, unknown> = {
     itemType: 'attachment',
-    parentItem: file.parent,
     linkMode: 'imported_file',
     title: file.title ?? file.filename,
     contentType: file.contentType,
     tags: [],
   };
+  if (file.parent) item.parentItem = file.parent;
   // Keep the provenance of a downloaded file on the attachment itself.
   if (file.url) item.url = file.url;
-  const result = await ctx.localWrites.writeItems([item]);
+  const result = await ctx.localWrites.writeItems([item], lib);
   if (result.failed.length || !result.successful.length) {
     throw new Error(`Could not create attachment item: ${JSON.stringify(result.failed)}`);
   }
   const attachmentKey = result.successful[0]?.key;
   if (!attachmentKey) throw new Error('Local write returned no attachment key.');
   try {
-    await ctx.localWrites.uploadFile(attachmentKey, {
-      bytes: file.bytes,
-      filename: file.filename,
-      contentType: file.contentType,
-    });
+    await ctx.localWrites.uploadFile(
+      attachmentKey,
+      { bytes: file.bytes, filename: file.filename, contentType: file.contentType },
+      lib,
+    );
   } catch (e) {
     throw new AttachmentUploadError(attachmentKey, e);
   }

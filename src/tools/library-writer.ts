@@ -1,6 +1,6 @@
 import type { ToolContext } from '../registry/registry.js';
-import { ensureLocalApi, isLocalWritesUnavailable, isPersonalLibrary, requireCloud } from '../registry/registry.js';
-import type { LibraryRef, WriteResult } from '../api/web-client.js';
+import { desktopTakesWrites, isLocalWritesUnavailable, requireCloud } from '../registry/registry.js';
+import type { LibraryRef, ListResult, WriteResult } from '../api/web-client.js';
 import type { LocalWriteClient } from '../api/local-writes.js';
 
 /**
@@ -18,9 +18,15 @@ export interface LibraryWriter {
   readonly target: 'local' | 'cloud';
   readonly lib: LibraryRef;
   getItem(key: string): Promise<any>;
+  /** One page of an item's direct children (notes and attachments), with the library version it was read at. */
+  getChildren(key: string, page: { start?: number; limit?: number }): Promise<ListResult>;
   /** One collection in `{ key, version, data }` shape, or null when there is none. */
   getCollection(key: string): Promise<any | null>;
-  writeItems(objects: Record<string, unknown>[]): Promise<WriteResult>;
+  /**
+   * `opts.libraryVersion` pins the write to that library version: refused with 412 if
+   * anything in the library moved since, on either API.
+   */
+  writeItems(objects: Record<string, unknown>[], opts?: { libraryVersion?: number }): Promise<WriteResult>;
   writeCollections(objects: Record<string, unknown>[]): Promise<WriteResult>;
   writeSearches(objects: Record<string, unknown>[]): Promise<WriteResult>;
   /** PATCH one item at its own version; 412 (a ZoteroApiError) when it changed since. */
@@ -64,8 +70,9 @@ function cloudWriter(ctx: ToolContext, lib: LibraryRef): LibraryWriter {
     target: 'cloud',
     lib,
     getItem: (key) => ctx.web.getItem(lib, key),
+    getChildren: (key, page) => ctx.web.getItemChildren(lib, key, page),
     getCollection: (key) => ctx.web.getCollection(lib, key),
-    writeItems: (objects) => ctx.web.writeItems(lib, objects),
+    writeItems: (objects, opts) => (opts ? ctx.web.writeItems(lib, objects, opts) : ctx.web.writeItems(lib, objects)),
     writeCollections: (objects) => ctx.web.writeCollections(lib, objects),
     writeSearches: (objects) => ctx.web.writeSearches(lib, objects),
     patchItem: (key, patch, version) => ctx.web.patchItem(lib, key, patch, version),
@@ -81,16 +88,21 @@ function localWriter(ctx: ToolContext, lib: LibraryRef, client: LocalWriteClient
     lib,
     landed: false,
     getItem: (key: string) => (ctx.local ? ctx.local.getItem(key, {}, lib) : ctx.router.getItem(key, { library: lib })),
+    getChildren: (key: string, page: { start?: number; limit?: number }) =>
+      ctx.local
+        ? ctx.local.getItemChildren(key, page, lib)
+        : ctx.router.getItemChildren(key, { library: lib, ...page }),
     getCollection: (key: string) => (ctx.local ? ctx.local.getCollection(key, lib) : ctx.router.getCollection(key, { library: lib })),
-    writeItems: (objects: Record<string, unknown>[]) => write(() => client.writeItems(objects)),
-    writeCollections: (objects: Record<string, unknown>[]) => write(() => client.writeCollections(objects)),
-    writeSearches: (objects: Record<string, unknown>[]) => write(() => client.writeSearches(objects)),
+    writeItems: (objects: Record<string, unknown>[], opts?: { libraryVersion?: number }) =>
+      write(() => (opts ? client.writeItems(objects, lib, opts) : client.writeItems(objects, lib))),
+    writeCollections: (objects: Record<string, unknown>[]) => write(() => client.writeCollections(objects, lib)),
+    writeSearches: (objects: Record<string, unknown>[]) => write(() => client.writeSearches(objects, lib)),
     patchItem: (key: string, patch: Record<string, unknown>, version: number) =>
-      write(() => client.patchItem(key, patch, version)),
-    deleteCollections: (keys: string[]) => write(() => client.deleteCollections(keys)),
-    deleteSearches: (keys: string[]) => write(() => client.deleteSearches(keys)),
+      write(() => client.patchItem(key, patch, version, lib)),
+    deleteCollections: (keys: string[]) => write(() => client.deleteCollections(keys, lib)),
+    deleteSearches: (keys: string[]) => write(() => client.deleteSearches(keys, lib)),
     setFullText: (key: string, body: Parameters<LibraryWriter['setFullText']>[1]) =>
-      write(() => client.setFullText(key, body)),
+      write(() => client.setFullText(key, body, lib)),
   };
   async function write<T>(op: () => Promise<T>): Promise<T> {
     try {
@@ -114,16 +126,18 @@ function localWriter(ctx: ToolContext, lib: LibraryRef, client: LocalWriteClient
  * (`zotero_trash_items`, `zotero_delete_items`, `zotero_annotate`), shared so the rest stop
  * demanding a cloud key the desktop makes unnecessary.
  *
- * The desktop is tried for the personal library only, and only when it is up. If it turns
- * out not to take writes before anything was written, `run` starts over on the cloud, which
- * `requireCloud` gates with the reason there is no cloud to fall back to.
+ * The desktop is tried for every library it holds (the personal one, and each group in
+ * `capabilities.localGroupIds`), only when it is up, and not while a cloud write to that
+ * library is waiting for it to sync: see `desktopTakesWrites`. If it turns out not to take
+ * writes before anything was written, `run` starts over on the cloud, which `requireCloud`
+ * gates with the reason there is no cloud to fall back to.
  */
 export async function withLibraryWriter<T>(
   ctx: ToolContext,
   lib: LibraryRef,
   run: (writer: LibraryWriter) => Promise<T>,
 ): Promise<T> {
-  if (ctx.localWrites && isPersonalLibrary(lib) && (await ensureLocalApi(ctx))) {
+  if (ctx.localWrites && (await desktopTakesWrites(ctx, lib))) {
     try {
       return await run(localWriter(ctx, lib, ctx.localWrites));
     } catch (e) {

@@ -7,9 +7,8 @@ import type { LibraryRef } from '../api/web-client.js';
 import { libraryArgs } from './common-args.js';
 import {
   ok,
-  ensureLocalApi,
+  desktopTakesWrites,
   isLocalWritesUnavailable,
-  isPersonalLibrary,
   requireCloud,
   resolveLibrary,
 } from '../registry/registry.js';
@@ -160,7 +159,7 @@ const attachFile: ToolDefinition = {
     content_type: z.string().optional().describe('MIME type; inferred from the extension if omitted (pdf -> application/pdf).'),
     title: z.string().optional().describe('Attachment title, e.g. "Full Text PDF".'),
     ...libraryArgs,
-    library_id: libraryArgs.library_id.describe('Group library to attach the file in (from zotero_groups); forces the cloud path instead of the desktop app.'),
+    library_id: libraryArgs.library_id.describe('Group library to attach the file in (from zotero_groups). Goes to the desktop app when it holds that group (Zotero 10+), otherwise to the cloud.'),
   },
   outputSchema: z
     .object({
@@ -211,13 +210,12 @@ const attachFile: ToolDefinition = {
         throw e;
       }
     }
-    // Desktop first for the personal library: no cloud key, no quota, bytes never leave
-    // the machine. Group libraries the app may not have are cloud-only either way.
+    // Desktop first for any library the app holds: no cloud key, no quota, bytes never
+    // leave the machine. A group the app does not hold is cloud-only.
     const lib = resolveLibrary(ctx, args);
-    const personal = isPersonalLibrary(lib);
-    const useLocal = personal && Boolean(ctx.localWrites) && (await ensureLocalApi(ctx));
-    // A group with no cloud key fails here, before any bytes are fetched.
-    if (!personal) requireCloud(ctx, lib);
+    const useLocal = await desktopTakesWrites(ctx, lib);
+    // A group with nowhere to go fails here, before any bytes are fetched.
+    if (!useLocal && lib.type === 'group') requireCloud(ctx, lib);
     if (!useLocal && !ctx.capabilities.cloud) {
       return err(
         'Storing a file needs one of two write paths, and neither is available: the Zotero desktop app (Zotero 10+ with the local API enabled, granted once when Zotero asks), or a cloud API key with file access (ZOTERO_API_KEY). ' +
@@ -256,14 +254,18 @@ const attachFile: ToolDefinition = {
 
     if (useLocal) {
       try {
-        const attachmentKey = await storeLocalAttachment(ctx, {
-          parent: args.parent,
-          bytes,
-          filename,
-          contentType,
-          title: attachTitle,
-          url: fileUrl,
-        });
+        const attachmentKey = await storeLocalAttachment(
+          ctx,
+          {
+            parent: args.parent,
+            bytes,
+            filename,
+            contentType,
+            title: attachTitle,
+            url: fileUrl,
+          },
+          lib,
+        );
         return ok(
           { attachment: attachmentKey, parent: args.parent, filename, bytes: bytes.length, contentType, target: 'local', oa: oaOut },
           `Attached ${filename} (${bytes.length} bytes) to item ${args.parent} as ${attachmentKey}.${oaLine}`,

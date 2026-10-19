@@ -108,7 +108,7 @@ describe('zotero_annotate action:"delete"', () => {
       logger: { debug() {}, info() {}, warn() {}, error() {} },
     };
     const res = await annotate.handler({ action: 'delete', annotation_keys: ['ANN1'] }, ctx);
-    expect(setDeleted).toHaveBeenCalledWith(['ANN1'], 1);
+    expect(setDeleted).toHaveBeenCalledWith(['ANN1'], 1, { type: 'user', id: 0 });
     expect(deleteItems).not.toHaveBeenCalled();
     expect(res.structuredContent?.trashed).toEqual(['ANN1']);
   });

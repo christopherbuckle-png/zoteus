@@ -233,12 +233,19 @@ describe("the key's own access map decides a group write before the request (#74
     expect(web.writeItems.mock.calls[0]![0]).toEqual(GROUP);
   });
 
-  it('tells a key-free install that the desktop app cannot stand in for a group write', () => {
+  it('tells a key-free install with no desktop app either of the two ways a group write can go', () => {
     const { ctx } = makeCtx({ access: null });
     expect(() => requireCloud(ctx, GROUP)).toThrow(/group library 456/);
     expect(() => requireCloudLibrary(ctx, { library_type: 'group', library_id: GROUP_ID })).toThrow(
-      /personal library only/,
+      /Zotero desktop app running \(Zotero 10 or newer, with that group synced into it\) or a Zotero cloud API key/,
     );
+  });
+
+  it('tells a key-free install whose desktop app lacks the group that the app does not hold it', () => {
+    const { ctx } = makeCtx({ access: null });
+    ctx.capabilities.localApi = true;
+    expect(() => requireCloud(ctx, GROUP)).toThrow(/desktop app does not hold group library 456/);
+    expect(() => requireCloud(ctx, GROUP)).toThrow(/zotero_groups/);
   });
 });
 

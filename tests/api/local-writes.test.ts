@@ -396,10 +396,139 @@ describe('LocalWriteClient (Zotero 10+ desktop writes)', () => {
     expect(isLocalWritesUnavailable(noEndpoint)).toBe(true);
   });
 
+  it('does not read a 400 about the content as a missing write path, whatever its words', async () => {
+    // Measured on 10.0.6: full text for a text/plain attachment. The desktop took the request
+    // and judged it, so neither the cloud fallback nor the "update Zotero" refusal applies.
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) =>
+      (init?.method ?? 'GET') === 'GET'
+        ? probeResponse()
+        : new Response('Full-text content is not supported for this item type', { status: 400 }),
+    );
+    const client = makeClient(fetchImpl, { key: 'k' });
+    const e = await client.setFullText('TXTATT01', { content: 'x' }).catch((x: Error) => x);
+    expect((e as Error).message).toMatch(/failed \(400\): Full-text content is not supported/);
+    expect(isLocalWritesUnavailable(e)).toBe(false);
+    // A Zotero 9 answer still is one.
+    expect(isLocalWritesUnavailable(new Error('Local API local write failed (501): Endpoint does not support method'))).toBe(true);
+  });
+
   it('reports a read-only local API (Zotero 9 and earlier) as "not supported"', async () => {
     // 9.x answers reads fine but never sends Zotero-Server-ID, since writes do not exist.
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify([]), { status: 200 }));
     const client = makeClient(fetchImpl, { key: 'k' });
     await expect(client.writeItems([{ itemType: 'book' }])).rejects.toThrow(/not supported/i);
+  });
+});
+
+describe('LocalWriteClient group libraries (Zotero 10.0.6 takes writes on /api/groups/<id>)', () => {
+  const GROUP = { type: 'group' as const, id: 6666644 };
+
+  /** A desktop holding the personal library at version 17 and group 6666644 at version 5. */
+  function twoLibraries(write: (url: string, init: RequestInit) => Response) {
+    const seen: Array<{ method: string; url: string; headers: Record<string, string> }> = [];
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      const method = init?.method ?? 'GET';
+      seen.push({ method, url, headers: (init?.headers ?? {}) as Record<string, string> });
+      if (method === 'GET') return probeResponse(SERVER_ID, url.includes('/groups/6666644/') ? '5' : '17');
+      return write(url, init);
+    });
+    return { seen, client: makeClient(fetchImpl, { key: 'k' }) };
+  }
+
+  it("writes under /groups/<id> and sends that group's own version, not the personal library's", async () => {
+    const { seen, client } = twoLibraries(() =>
+      okJson({ successful: { '0': { key: 'GRPCOL01', version: 6 } }, failed: {}, unchanged: {} }, { 'last-modified-version': '6' }),
+    );
+    await client.writeCollections([{ key: 'GRPCOL01', name: 'Renamed' }], GROUP);
+    const post = seen.find((s) => s.method === 'POST')!;
+    expect(post.url).toBe('http://127.0.0.1:23119/api/groups/6666644/collections');
+    expect(post.headers['If-Unmodified-Since-Version']).toBe('5');
+    // The group's probe reads the group's own collections listing, which carries its version.
+    expect(seen.some((s) => s.method === 'GET' && s.url.endsWith('/groups/6666644/collections?limit=1'))).toBe(true);
+
+    // The personal library still writes at its own version, unaffected by the group's.
+    await client.writeItems([{ key: 'ITEM0001', title: 'x' }]);
+    const personal = seen.filter((s) => s.method === 'POST').at(-1)!;
+    expect(personal.url).toBe('http://127.0.0.1:23119/api/users/0/items');
+    expect(personal.headers['If-Unmodified-Since-Version']).toBe('17');
+  });
+
+  it('routes every write method to the group', async () => {
+    const { seen, client } = twoLibraries((url) =>
+      url.includes('/file')
+        ? okJson({ exists: 1 })
+        : url.endsWith('/items') || url.endsWith('/searches')
+          ? okJson({ successful: { '0': { key: 'K', version: 6 } }, failed: {}, unchanged: {} })
+          : new Response(null, { status: 204, headers: { 'last-modified-version': '6' } }),
+    );
+    await client.setDeleted(['K1'], 1, GROUP);
+    await client.patchItem('K1', { title: 't' }, 4, GROUP);
+    await client.deleteItems(['K1'], GROUP);
+    await client.deleteCollections(['C1'], GROUP);
+    await client.writeSearches([{ name: 's', conditions: [] }], GROUP);
+    await client.deleteSearches(['S1'], GROUP);
+    await client.setFullText('K1', { content: 'x' }, GROUP);
+    await client.uploadFile('K1', { bytes: new Uint8Array([1]), filename: 'a.pdf', contentType: 'application/pdf' }, GROUP);
+    const writes = seen.filter((s) => s.method !== 'GET').map((s) => `${s.method} ${s.url.replace('http://127.0.0.1:23119/api', '')}`);
+    expect(writes).toEqual([
+      'POST /groups/6666644/items',
+      'PATCH /groups/6666644/items/K1',
+      'DELETE /groups/6666644/items?itemKey=K1',
+      'DELETE /groups/6666644/collections?collectionKey=C1',
+      'POST /groups/6666644/searches',
+      'DELETE /groups/6666644/searches?searchKey=S1',
+      'PUT /groups/6666644/items/K1/fulltext',
+      'POST /groups/6666644/items/K1/file',
+    ]);
+  });
+
+  it('turns "Write access denied" (a group this account may not edit) into a refusal that names the group and is not a reason to try the cloud', async () => {
+    const { client } = twoLibraries(() => new Response('Write access denied', { status: 403 }));
+    const e = (await client.writeItems([{ itemType: 'book' }], GROUP).catch((x: Error) => x)) as Error;
+    expect(e.message).toMatch(/may not edit group library 6666644/);
+    expect(e.message).toMatch(/Library Editing/);
+    expect(e.message).toMatch(/Nothing was written/);
+    expect((e as any).status).toBe(403);
+    expect(isLocalWritesUnavailable(e)).toBe(false);
+  });
+
+  it('turns "File editing denied" into a refusal about files', async () => {
+    const { client } = twoLibraries(() => new Response('File editing denied', { status: 403 }));
+    const e = (await client
+      .uploadFile('K1', { bytes: new Uint8Array([1]), filename: 'a.pdf', contentType: 'application/pdf' }, GROUP)
+      .catch((x: Error) => x)) as Error;
+    expect(e.message).toMatch(/may not store files in group library 6666644/);
+    expect(e.message).toMatch(/File Editing/);
+    expect(isLocalWritesUnavailable(e)).toBe(false);
+  });
+
+  it('reports a group the desktop does not hold as a missing write path, before any grant or write', async () => {
+    const seen: string[] = [];
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      seen.push(`${init?.method ?? 'GET'} ${url}`);
+      if (url.includes('/groups/')) return new Response('Not found', { status: 404 });
+      return probeResponse();
+    });
+    const client = makeClient(fetchImpl);
+    const e = (await client.writeItems([{ itemType: 'book' }], GROUP).catch((x: Error) => x)) as Error;
+    expect(e.message).toMatch(/does not hold that group/);
+    // Read as "the desktop cannot take this", so a cloud key gets the write instead.
+    expect(isLocalWritesUnavailable(e)).toBe(true);
+    expect(seen.some((s) => s.includes('/local/authorize'))).toBe(false);
+    expect(seen.some((s) => s.startsWith('POST'))).toBe(false);
+  });
+
+  it('pins a write to a library version the caller read, and does not quietly re-probe past it', async () => {
+    const posts: Array<Record<string, string>> = [];
+    const { client } = twoLibraries((_url, init) => {
+      posts.push((init.headers ?? {}) as Record<string, string>);
+      return new Response('Library has been modified since specified version (expected 5, found 7)', { status: 412 });
+    });
+    const e = (await client
+      .writeItems([{ key: 'DUP00001', version: 3, deleted: 1 }], GROUP, { libraryVersion: 5 })
+      .catch((x: Error) => x)) as Error;
+    expect((e as any).status).toBe(412);
+    // The one retry (for a restarted Zotero's new server id) resends the SAME pin.
+    expect(posts.map((h) => h['If-Unmodified-Since-Version'])).toEqual(['5', '5']);
   });
 });

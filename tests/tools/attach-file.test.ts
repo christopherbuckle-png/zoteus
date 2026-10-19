@@ -160,6 +160,22 @@ describe('zotero_attach_file', () => {
     expect(ctx.web.writeItems).toHaveBeenCalledWith({ type: 'group', id: 456 }, expect.any(Array));
   });
 
+  it('attaches in a group the desktop app holds through the desktop, addressed to that group', async () => {
+    const writeItems = vi.fn(async () => localWriteResult);
+    const uploadFile = vi.fn(async () => {});
+    const ctx = makeCtx({
+      capabilities: { cloud: null, localApi: true, localGroupIds: [456] },
+      localWrites: { hasStoredKey: () => true, writeItems, uploadFile },
+      router: { defaultLibrary: () => ({ type: 'group', id: 456 }) },
+    });
+    const res = await attachFile.handler({ parent: 'ITEM1', url: PDF_URL }, ctx);
+
+    expect((res.structuredContent as any).target).toBe('local');
+    expect((writeItems.mock.calls[0] as unknown[])[1]).toEqual({ type: 'group', id: 456 });
+    expect((uploadFile.mock.calls[0] as unknown[])[2]).toEqual({ type: 'group', id: 456 });
+    expect(ctx.web.writeItems).not.toHaveBeenCalled();
+  });
+
   it('refuses a group target with no cloud key before downloading anything (#61)', async () => {
     const ctx = makeCtx({
       capabilities: { cloud: null, localApi: true },

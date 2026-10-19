@@ -40,7 +40,7 @@ describe('zotero_fulltext action:"set" refuses in terms of the operation, not th
     expect(msg).toMatch(/did not accept this write/);
     expect(msg).toMatch(/ZOTERO_API_KEY/);
     expect(msg).not.toMatch(/cloud\/group/);
-    expect(ctx.localWrites.setFullText).toHaveBeenCalledWith('CKSETW3U', expect.objectContaining({ content: 'text' }));
+    expect(ctx.localWrites.setFullText).toHaveBeenCalledWith('CKSETW3U', expect.objectContaining({ content: 'text' }), expect.objectContaining({ type: 'user' }));
     expect(setFullText).not.toHaveBeenCalled();
   });
 

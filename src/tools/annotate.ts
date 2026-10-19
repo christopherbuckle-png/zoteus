@@ -9,7 +9,8 @@ import {
   isPersonalLibrary,
   requireCloud,
   isLocalWritesUnavailable,
-  ensureLocalApi,
+  desktopTakesWrites,
+  writesGoToDesktop,
   writeResult,
 } from '../registry/registry.js';
 import { locatePassages, pageHeights, type PassageAnchor } from '../features/fulltext/pdf-locate.js';
@@ -230,7 +231,7 @@ const annotateTool: ToolDefinition = {
   name: 'zotero_annotate',
   title: 'Annotate a PDF (highlights, notes)',
   description:
-    'Add or delete Zotero PDF annotations (highlights, underlines, notes), the same objects you create in the Zotero PDF reader. `action:"add"` needs `parent` (a regular item key OR a PDF attachment key) and `annotations`: each with `type` (highlight|note|underline, default highlight), `text` (the exact passage to highlight), optional `comment`, `color`, `page` (0-based page index). **You do not need page coordinates**: give the passage in `text` and it is located in the PDF and anchored to the exact lines it occupies, so quoting a passage is enough to highlight it. Pass `page` to disambiguate a passage that repeats, or `occurrence` to pick among repeats; pass `position` ({"pageIndex":N,"rects":[[x1,y1,x2,y2],...]} in PDF points, bottom-left origin) only to place a highlight yourself. `action:"delete"` trashes the annotations in `annotation_keys`. Writes go to the running Zotero desktop app for your personal library (via its connector protocol, or its local-API writes where available), otherwise to the cloud Web API.',
+    'Add or delete Zotero PDF annotations (highlights, underlines, notes), the same objects you create in the Zotero PDF reader. `action:"add"` needs `parent` (a regular item key OR a PDF attachment key) and `annotations`: each with `type` (highlight|note|underline, default highlight), `text` (the exact passage to highlight), optional `comment`, `color`, `page` (0-based page index). **You do not need page coordinates**: give the passage in `text` and it is located in the PDF and anchored to the exact lines it occupies, so quoting a passage is enough to highlight it. Pass `page` to disambiguate a passage that repeats, or `occurrence` to pick among repeats; pass `position` ({"pageIndex":N,"rects":[[x1,y1,x2,y2],...]} in PDF points, bottom-left origin) only to place a highlight yourself. `action:"delete"` trashes the annotations in `annotation_keys`. Writes go to the running Zotero desktop app for your personal library (via its local-API writes where available, or its connector protocol) and for any group library the app holds (local-API writes, Zotero 10+), otherwise to the cloud Web API.',
   inputSchema: {
     action: z.enum(['add', 'delete']).optional().describe('Default "add".'),
     parent: z.string().optional().describe('Item key or PDF attachment key to annotate.'),
@@ -267,7 +268,8 @@ const annotateTool: ToolDefinition = {
   handler: async (args, ctx) => {
     const action = args.action ?? 'add';
     // Decided once, so the parent and children reads, the PDF bytes and the write all name
-    // the same library; the desktop shortcuts below apply only to the personal one (#61).
+    // the same library. Local-API writes take any library the desktop holds; the connector
+    // protocol saves into whatever library the app has open, so it is personal-only (#61).
     const lib = resolveLibrary(ctx, args);
     const personal = isPersonalLibrary(lib);
 
@@ -276,10 +278,10 @@ const annotateTool: ToolDefinition = {
       if (!keys.length) {
         return { content: [{ type: 'text', text: '`annotation_keys` is required for action:"delete".' }], isError: true };
       }
-      if (personal && (await ensureLocalApi(ctx)) && ctx.localWrites) {
+      if (ctx.localWrites && (await desktopTakesWrites(ctx, lib))) {
         try {
           // `deleted: 1` (reversible trash), not DELETE — the local API's DELETE erases.
-          const result = await ctx.localWrites.setDeleted(keys, 1);
+          const result = await ctx.localWrites.setDeleted(keys, 1, lib);
           const trashed = [...result.successful.map((s) => s.key), ...result.unchanged];
           return writeResult(
             { trashed, failed: result.failed, target: 'local' },
@@ -434,13 +436,14 @@ const annotateTool: ToolDefinition = {
     }
     const notes = anchorNote(anchored.size) + sortOrderNote(unsorted);
 
-    // Prefer the desktop app for the personal library; fall back to the cloud.
+    // Prefer the desktop app for any library it holds; fall back to the cloud.
     // (a) Zotero 10+ local-API writes (the first one asks for a key in-app — choose
-    //     "Always Allow" to be asked once), or (b) the connector protocol that every
-    //     recent Zotero exposes while running.
-    if (personal && (await ensureLocalApi(ctx)) && ctx.localWrites) {
+    //     "Always Allow" to be asked once), or (b) for the personal library only, the
+    //     connector protocol that every recent Zotero exposes while running. Both are
+    //     skipped while a cloud write to this library waits for the app to sync it.
+    if (ctx.localWrites && (await desktopTakesWrites(ctx, lib))) {
       try {
-        const result = await ctx.localWrites.writeItems(items);
+        const result = await ctx.localWrites.writeItems(items, lib);
         if (result.failed.length) {
           return { content: [{ type: 'text', text: `Local write failed: ${JSON.stringify(result.failed)}` }], isError: true };
         }
@@ -458,7 +461,7 @@ const annotateTool: ToolDefinition = {
         ctx.logger.info(`Local-API writes unavailable (${e instanceof Error ? e.message : e}); using the connector protocol.`);
       }
     }
-    if (personal && ctx.connectorWrites && (await ensureLocalApi(ctx))) {
+    if (personal && ctx.connectorWrites && (await writesGoToDesktop(ctx, lib))) {
       const { sessionID } = await ctx.connectorWrites.saveItems(items, { uri: 'zotero://zoteus/annotate' });
       // The connector returns no keys; recover them by querying the local API.
       const created = await pollCreatedAnnotations(ctx, targetAttachment, items);

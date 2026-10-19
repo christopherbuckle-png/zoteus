@@ -137,7 +137,7 @@ describe('zotero_trash_items', () => {
     const ctx = makeCtx({ top: { localWrites: { setDeleted, deleteItems: deleteItemsLocal } } });
     ctx.capabilities.localApi = true;
     const res = await trashItems.handler({ item_keys: ['K1', 'K2'] }, ctx);
-    expect(setDeleted).toHaveBeenCalledWith(['K1', 'K2'], 1);
+    expect(setDeleted).toHaveBeenCalledWith(['K1', 'K2'], 1, { type: 'user', id: 19552201 });
     expect(deleteItemsLocal).not.toHaveBeenCalled();
     expect(ctx.web.writeItems).not.toHaveBeenCalled();
     expect(res.structuredContent?.updated).toEqual(['K1', 'K2']);
@@ -171,7 +171,7 @@ describe('zotero_delete_items', () => {
     const ctx = makeCtx({ config: { allowDelete: true }, top: { localWrites: { deleteItems: localDelete } } });
     ctx.capabilities.localApi = true;
     const res = await deleteItems.handler({ item_keys: ['K1'], confirm: true }, ctx);
-    expect(localDelete).toHaveBeenCalledWith(['K1']);
+    expect(localDelete).toHaveBeenCalledWith(['K1'], { type: 'user', id: 19552201 });
     expect(ctx.web.deleteItems).not.toHaveBeenCalled();
     expect(res.structuredContent?.target).toBe('local');
   });

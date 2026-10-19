@@ -5,17 +5,16 @@ import { libraryArgs } from './common-args.js';
 import {
   ok,
   resolveLibrary,
-  isPersonalLibrary,
   requireCloud,
   isLocalWritesUnavailable,
-  ensureLocalApi,
+  desktopTakesWrites,
 } from '../registry/registry.js';
 
 const deleteItems: ToolDefinition = {
   name: 'zotero_delete_items',
   title: 'Permanently delete Zotero items',
   description:
-    'PERMANENTLY and IRREVERSIBLY delete items by key (this purges them — it is NOT the trash). Prefer zotero_trash_items, which is reversible. This tool is disabled unless the server is started with ZOTEUS_ALLOW_DELETE=true, and additionally requires `confirm: true` on every call. For the personal library it goes through the running Zotero desktop app when that app supports local-API writes, otherwise the cloud Web API. The current library version is used as a precondition; the operation auto-chunks to 50 keys per request.',
+    'PERMANENTLY and IRREVERSIBLY delete items by key (this purges them; it is NOT the trash). Prefer zotero_trash_items, which is reversible. This tool is disabled unless the server is started with ZOTEUS_ALLOW_DELETE=true, and additionally requires `confirm: true` on every call. For the personal library, and for a group library the running Zotero desktop app holds, it goes through that app when it supports local-API writes (Zotero 10+), otherwise the cloud Web API. The current library version is used as a precondition; the operation auto-chunks to 50 keys per request.',
   inputSchema: {
     item_keys: z.array(z.string()).min(1).describe('Item keys to permanently delete.'),
     confirm: z.boolean().optional().describe('Must be true to proceed with permanent deletion.'),
@@ -53,11 +52,11 @@ const deleteItems: ToolDefinition = {
       };
     }
     const lib = resolveLibrary(ctx, args);
-    // Local-first for the personal library: Zotero 10's local API implements the same
-    // multi-DELETE (with the library-version precondition), so no cloud key is needed.
-    if (ctx.localWrites && isPersonalLibrary(lib) && (await ensureLocalApi(ctx))) {
+    // Local-first for any library the desktop holds: Zotero 10's local API implements the
+    // same multi-DELETE (with the library-version precondition), so no cloud key is needed.
+    if (ctx.localWrites && (await desktopTakesWrites(ctx, lib))) {
       try {
-        await ctx.localWrites.deleteItems(args.item_keys);
+        await ctx.localWrites.deleteItems(args.item_keys, lib);
         return ok(
           { deleted: args.item_keys, count: args.item_keys.length, target: 'local' },
           `Permanently deleted ${args.item_keys.length} item(s) via the Zotero desktop app.`,

@@ -3,8 +3,8 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { RateLimitedFetcher, type FetchLike } from './http.js';
 import { ZoteroApiError } from './errors.js';
-import { LIVENESS_PATH } from './local-client.js';
-import type { WriteResult } from './web-client.js';
+import { LIVENESS_PATH, localLibraryPrefix } from './local-client.js';
+import type { LibraryRef, WriteResult } from './web-client.js';
 import type { Logger } from '../lib/logger.js';
 
 export interface LocalWriteClientOptions {
@@ -49,9 +49,12 @@ function chunks(keys: string[]): string[][] {
  *
  * Local-API write support shipped in Zotero 10 (it is absent in 9.x, whose local API is
  * GET-only). Writes go to the same local API the reads use
- * (http://127.0.0.1:23119/api/users/0/...), gated by a *local* API key the user grants
- * through a one-time in-Zotero dialog. Verified against zotero/zotero @ 10.0.0,
- * chrome/content/zotero/xpcom/server/server_localAPI.js:
+ * (http://127.0.0.1:23119/api/users/0/... for the personal library,
+ * .../api/groups/<groupID>/... for a group the app holds), gated by a *local* API key the
+ * user grants through a one-time in-Zotero dialog. Every write method takes the library as
+ * its last argument and defaults to the personal one. Verified against zotero/zotero @
+ * 10.0.0, chrome/content/zotero/xpcom/server/server_localAPI.js, and against the 10.0.6
+ * build's omni.ja for groups:
  *
  *   1. Every response carries a `Zotero-Server-ID` header; every request using a write
  *      method must echo it back — 428 when missing, 412 when it no longer matches the
@@ -66,7 +69,13 @@ function chunks(keys: string[]): string[][] {
  *   4. Concurrency preconditions are enforced as in the Web API: multi-object DELETE
  *      *requires* `If-Unmodified-Since-Version`, and key-based writes require either it
  *      or a per-object `version` (428 otherwise). We send the library version we last
- *      observed and re-probe once on 412/428.
+ *      observed and re-probe once on 412/428. Each library has its own version sequence
+ *      (a group's `clientVersion` has nothing to do with the personal library's), so the
+ *      version is tracked per library.
+ *   5. A write to a library the app holds read-only is refused with 403 "Write access
+ *      denied" (`library.editable`, checked after the key and before the write runs).
+ *      Only a group can be read-only: one whose Library Editing setting leaves this user
+ *      out. File uploads have their own 403 "File editing denied" (`filesEditable`).
  *
  * Keys are unrelated to zotero.org cloud keys. Grants are cached on disk so the user
  * is prompted once ("Always Allow"); single-use "Allow" grants degrade gracefully by
@@ -81,7 +90,8 @@ export class LocalWriteClient {
   private readonly fetchImpl: FetchLike | undefined;
   private key?: string;
   private serverId?: string;
-  private libraryVersion?: number;
+  /** Each library's version as last seen, keyed by its local path prefix (`/users/0`, `/groups/<id>`). */
+  private readonly libraryVersions = new Map<string, number>();
 
   constructor(opts: LocalWriteClientOptions = {}) {
     this.base = `http://127.0.0.1:${opts.port ?? 23119}/api`;
@@ -107,19 +117,29 @@ export class LocalWriteClient {
    * `Zotero-Server-ID` of the running instance and the library's current version
    * (`Last-Modified-Version`), used as the concurrency precondition on writes. Both come on
    * every local API response, so the read is the same cheap one the liveness probe makes,
-   * not an items listing that costs the size of the library (#102).
+   * not an items listing that costs the size of the library (#102). For a group it is the
+   * group's own collections listing, which carries that group's version.
    */
-  private async probe(force = false): Promise<{ serverId: string; libraryVersion: number }> {
-    if (!force && this.serverId !== undefined && this.libraryVersion !== undefined) {
-      return { serverId: this.serverId, libraryVersion: this.libraryVersion };
+  private async probe(force = false, lib?: LibraryRef): Promise<{ serverId: string; libraryVersion: number }> {
+    const prefix = localLibraryPrefix(lib);
+    const known = this.libraryVersions.get(prefix);
+    if (!force && this.serverId !== undefined && known !== undefined) {
+      return { serverId: this.serverId, libraryVersion: known };
     }
+    const path = lib?.type === 'group' ? `${prefix}/collections?limit=1` : LIVENESS_PATH;
     const res = await this.fetcher.fetch(
-      `${this.base}${LIVENESS_PATH}`,
+      `${this.base}${path}`,
       { method: 'GET', headers: this.readHeaders() },
       { maxRetries: 0, fetchImpl: this.fetchImpl },
     );
     if (!res.ok) {
       await res.body?.cancel().catch(() => {});
+      // Zotero answers 404 for a group it does not hold. Worded so `isLocalWritesUnavailable`
+      // still reads it as "the desktop cannot take this", which it is: nothing was written,
+      // and the cloud may well hold that group.
+      if (lib?.type === 'group' && res.status === 404) {
+        throw new Error(`Local API 404 for group library ${lib.id}: the running Zotero desktop app does not hold that group.`);
+      }
       throw new Error(`Local API unreachable (HTTP ${res.status}) — is Zotero running?`);
     }
     const id = res.headers.get('zotero-server-id');
@@ -132,8 +152,14 @@ export class LocalWriteClient {
       );
     }
     this.serverId = id;
-    this.libraryVersion = Number.isFinite(version) ? version : 0;
-    return { serverId: id, libraryVersion: this.libraryVersion };
+    const libraryVersion = Number.isFinite(version) ? version : 0;
+    this.libraryVersions.set(prefix, libraryVersion);
+    return { serverId: id, libraryVersion };
+  }
+
+  /** Record the version a write answered with, for the library it was made in. */
+  private noteVersion(lib: LibraryRef | undefined, version: number): void {
+    if (Number.isFinite(version) && version > 0) this.libraryVersions.set(localLibraryPrefix(lib), version);
   }
 
   /** Stable ID of the running Zotero instance (required on every write). */
@@ -141,9 +167,9 @@ export class LocalWriteClient {
     return (await this.probe()).serverId;
   }
 
-  /** Personal-library version last seen, used as the write precondition. */
-  private async getLibraryVersion(): Promise<number> {
-    return (await this.probe()).libraryVersion;
+  /** The library's version last seen, used as the write precondition. */
+  private async getLibraryVersion(lib?: LibraryRef): Promise<number> {
+    return (await this.probe(false, lib)).libraryVersion;
   }
 
   /**
@@ -237,9 +263,14 @@ export class LocalWriteClient {
    * re-auth/re-probe cases: 401 (key consumed/unknown -> authorize again) and
    * 412/428 (server-id or library version stale/missing -> refresh both).
    *
+   * `path` is relative to the library (`/items`, `/collections?…`), and `init.lib` names
+   * the library, so the prefix and the version precondition always belong to the same one.
+   *
    * `libraryPrecondition` adds `If-Unmodified-Since-Version`, which Zotero requires for
    * multi-object deletes and for key-based writes (it stands in for a per-object
-   * `version`). It is recomputed on retry so a refreshed version is actually used.
+   * `version`). It is recomputed on retry so a refreshed version is actually used. An
+   * explicit `If-Unmodified-Since-Version` in `init.headers` is a pin, not a guess: the retry
+   * resends it unchanged, so a library that really moved answers 412 to the caller.
    */
   private async request(
     method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
@@ -249,14 +280,18 @@ export class LocalWriteClient {
       form?: URLSearchParams;
       headers?: Record<string, string>;
       libraryPrecondition?: boolean;
+      lib?: LibraryRef;
     } = {},
     retried = false,
   ): Promise<Response> {
+    // The group's own probe first: for a group the desktop does not hold, that is where the
+    // refusal comes from, before a grant dialog is shown for a write that cannot land.
+    if (init.lib?.type === 'group') await this.probe(false, init.lib);
     await this.ensureKey();
     if (!this.key) await this.authorize();
     const headers = await this.writeHeaders();
     if (init.libraryPrecondition) {
-      headers['If-Unmodified-Since-Version'] = String(await this.getLibraryVersion());
+      headers['If-Unmodified-Since-Version'] = String(await this.getLibraryVersion(init.lib));
     }
     if (init.json !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -264,7 +299,7 @@ export class LocalWriteClient {
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
     const res = await this.fetcher.fetch(
-      `${this.base}${path}`,
+      `${this.base}${localLibraryPrefix(init.lib)}${path}`,
       {
         method,
         headers: { ...headers, ...init.headers },
@@ -281,25 +316,36 @@ export class LocalWriteClient {
     if ((res.status === 412 || res.status === 428) && !retried) {
       await res.body?.cancel().catch(() => {});
       // Either the instance changed or the library moved on: refresh both preconditions.
-      await this.probe(true);
+      await this.probe(true, init.lib);
       return this.request(method, path, init, true);
     }
     return res;
   }
 
-  /** Multi-write (create/update) of items, mirroring the Web API semantics. */
-  async writeItems(items: Record<string, unknown>[]): Promise<WriteResult> {
-    return this.writeObjects('items', items);
+  /**
+   * Multi-write (create/update) of items, mirroring the Web API semantics.
+   *
+   * `opts.libraryVersion` pins the whole request to that library version, exactly like the
+   * Web API's `writeItems(lib, objects, { libraryVersion })`: Zotero refuses it with 412 if
+   * anything in the library changed since, which is how a caller makes "nothing moved
+   * between my read and this write" part of the write itself.
+   */
+  async writeItems(
+    items: Record<string, unknown>[],
+    lib?: LibraryRef,
+    opts: { libraryVersion?: number } = {},
+  ): Promise<WriteResult> {
+    return this.writeObjects('items', items, lib, opts.libraryVersion);
   }
 
   /** Create or update collections (`{name, parentCollection}`, plus `key`+`version` to update). */
-  async writeCollections(collections: Record<string, unknown>[]): Promise<WriteResult> {
-    return this.writeObjects('collections', collections);
+  async writeCollections(collections: Record<string, unknown>[], lib?: LibraryRef): Promise<WriteResult> {
+    return this.writeObjects('collections', collections, lib);
   }
 
   /** Create or update saved searches (`{name, conditions}`). */
-  async writeSearches(searches: Record<string, unknown>[]): Promise<WriteResult> {
-    return this.writeObjects('searches', searches);
+  async writeSearches(searches: Record<string, unknown>[], lib?: LibraryRef): Promise<WriteResult> {
+    return this.writeObjects('searches', searches, lib);
   }
 
   /**
@@ -315,6 +361,8 @@ export class LocalWriteClient {
   private async writeObjects(
     kind: 'items' | 'collections' | 'searches',
     objects: Record<string, unknown>[],
+    lib?: LibraryRef,
+    pinnedVersion?: number,
   ): Promise<WriteResult> {
     const merged: WriteResult = { successful: [], unchanged: [], failed: [], newLibraryVersion: 0 };
     for (let offset = 0; offset < objects.length; offset += MAX_WRITE_OBJECTS) {
@@ -322,9 +370,15 @@ export class LocalWriteClient {
       const needsPrecondition = batch.some(
         (o) => typeof o.key === 'string' && o.key && (o.version === undefined || o.version === null),
       );
-      const res = await this.request('POST', `/users/0/${kind}`, { json: batch, libraryPrecondition: needsPrecondition });
-      const result = await this.parseWriteResult(res);
-      if (result.newLibraryVersion) this.libraryVersion = result.newLibraryVersion;
+      const res = await this.request(
+        'POST',
+        `/${kind}`,
+        pinnedVersion === undefined
+          ? { json: batch, libraryPrecondition: needsPrecondition, lib }
+          : { json: batch, headers: { 'If-Unmodified-Since-Version': String(pinnedVersion) }, lib },
+      );
+      const result = await this.parseWriteResult(res, lib);
+      this.noteVersion(lib, result.newLibraryVersion);
       merged.successful.push(...result.successful.map((s) => ({ ...s, index: s.index + offset })));
       merged.failed.push(...result.failed.map((f) => ({ ...f, index: f.index + offset })));
       merged.unchanged.push(...result.unchanged.map((i) => String(Number(i) + offset)));
@@ -338,11 +392,11 @@ export class LocalWriteClient {
    * reversible operation — the local API's DELETE, like the Web API's, erases items
    * outright and is exposed separately as {@link deleteItems}.
    */
-  async setDeleted(keys: string[], deleted: 0 | 1): Promise<WriteResult> {
+  async setDeleted(keys: string[], deleted: 0 | 1, lib?: LibraryRef): Promise<WriteResult> {
     const merged: WriteResult = { successful: [], unchanged: [], failed: [], newLibraryVersion: 0 };
     let offset = 0;
     for (const chunk of chunks(keys)) {
-      const res = await this.writeItems(chunk.map((key) => ({ key, deleted })));
+      const res = await this.writeItems(chunk.map((key) => ({ key, deleted })), lib);
       merged.successful.push(...res.successful.map((s) => ({ ...s, index: s.index + offset })));
       merged.failed.push(...res.failed.map((f) => ({ ...f, index: f.index + offset })));
       // `unchanged` is keyed by request index; resolve it back to item keys, since an
@@ -360,18 +414,18 @@ export class LocalWriteClient {
    * item changed since, which is the conflict a caller can resolve by re-reading it.
    * Without one, the library version last seen stands in.
    */
-  async patchItem(key: string, patch: Record<string, unknown>, version?: number): Promise<number> {
+  async patchItem(key: string, patch: Record<string, unknown>, version?: number, lib?: LibraryRef): Promise<number> {
     const res = await this.request(
       'PATCH',
-      `/users/0/items/${key}`,
+      `/items/${key}`,
       version === undefined
-        ? { json: patch, libraryPrecondition: true }
-        : { json: patch, headers: { 'If-Unmodified-Since-Version': String(version) } },
+        ? { json: patch, libraryPrecondition: true, lib }
+        : { json: patch, headers: { 'If-Unmodified-Since-Version': String(version) }, lib },
     );
-    if (!res.ok) await this.throwApi(res, `PATCH /items/${key}`);
+    if (!res.ok) await this.throwApi(res, `PATCH /items/${key}`, lib);
     const v = Number(res.headers.get('last-modified-version'));
     await res.body?.cancel().catch(() => {});
-    if (Number.isFinite(v)) this.libraryVersion = v;
+    this.noteVersion(lib, v);
     return Number.isFinite(v) ? v : 0;
   }
 
@@ -380,31 +434,36 @@ export class LocalWriteClient {
    * removes the objects outright (no trash), and requires the library-version
    * precondition. Use {@link setDeleted} for the reversible trash.
    */
-  async deleteItems(keys: string[]): Promise<void> {
-    await this.deleteByKeys('items', 'itemKey', keys);
+  async deleteItems(keys: string[], lib?: LibraryRef): Promise<void> {
+    await this.deleteByKeys('items', 'itemKey', keys, lib);
   }
 
   /**
    * Erase collections by key. As on the Web API, the items in them are not touched: they
    * lose that membership and stay in the library. Subcollections go with their parent.
    */
-  async deleteCollections(keys: string[]): Promise<void> {
-    await this.deleteByKeys('collections', 'collectionKey', keys);
+  async deleteCollections(keys: string[], lib?: LibraryRef): Promise<void> {
+    await this.deleteByKeys('collections', 'collectionKey', keys, lib);
   }
 
   /** Erase saved-search definitions by key (the items they matched are not touched). */
-  async deleteSearches(keys: string[]): Promise<void> {
-    await this.deleteByKeys('searches', 'searchKey', keys);
+  async deleteSearches(keys: string[], lib?: LibraryRef): Promise<void> {
+    await this.deleteByKeys('searches', 'searchKey', keys, lib);
   }
 
-  private async deleteByKeys(kind: 'items' | 'collections' | 'searches', param: string, keys: string[]): Promise<void> {
+  private async deleteByKeys(
+    kind: 'items' | 'collections' | 'searches',
+    param: string,
+    keys: string[],
+    lib?: LibraryRef,
+  ): Promise<void> {
     for (const chunk of chunks(keys)) {
-      const path = `/users/0/${kind}?${param}=${chunk.join(',')}`;
-      const res = await this.request('DELETE', path, { libraryPrecondition: true });
-      if (!res.ok && res.status !== 204) await this.throwApi(res, `DELETE ${path}`);
+      const path = `/${kind}?${param}=${chunk.join(',')}`;
+      const res = await this.request('DELETE', path, { libraryPrecondition: true, lib });
+      if (!res.ok && res.status !== 204) await this.throwApi(res, `DELETE ${path}`, lib);
       const v = Number(res.headers.get('last-modified-version'));
       await res.body?.cancel().catch(() => {});
-      if (Number.isFinite(v)) this.libraryVersion = v;
+      this.noteVersion(lib, v);
     }
   }
 
@@ -418,8 +477,9 @@ export class LocalWriteClient {
   async setFullText(
     key: string,
     body: { content: string; indexedChars?: number; totalChars?: number; indexedPages?: number; totalPages?: number },
+    lib?: LibraryRef,
   ): Promise<void> {
-    const res = await this.request('PUT', `/users/0/items/${key}/fulltext`, { json: body });
+    const res = await this.request('PUT', `/items/${key}/fulltext`, { json: body, lib });
     if (res.status === 404) {
       const text = await res.text().catch(() => '');
       // A build without the endpoint says "No endpoint found", which must stay a "Local API"
@@ -434,10 +494,10 @@ export class LocalWriteClient {
       }
       throw new ZoteroApiError({ status: 404, message: `Local API PUT /items/${key}/fulltext failed (404): ${text.slice(0, 400)}`, body: text });
     }
-    if (!res.ok && res.status !== 204) await this.throwApi(res, `PUT /items/${key}/fulltext`);
+    if (!res.ok && res.status !== 204) await this.throwApi(res, `PUT /items/${key}/fulltext`, lib);
     const v = Number(res.headers.get('last-modified-version'));
     await res.body?.cancel().catch(() => {});
-    if (Number.isFinite(v)) this.libraryVersion = v;
+    this.noteVersion(lib, v);
   }
 
   /**
@@ -448,10 +508,12 @@ export class LocalWriteClient {
   async uploadFile(
     attachmentKey: string,
     file: { bytes: Uint8Array; filename: string; contentType: string; mtimeMs?: number },
+    lib?: LibraryRef,
   ): Promise<void> {
     const md5 = createHash('md5').update(file.bytes).digest('hex');
     const mtime = file.mtimeMs ?? Date.now();
-    const authorize = await this.request('POST', `/users/0/items/${attachmentKey}/file`, {
+    const authorize = await this.request('POST', `/items/${attachmentKey}/file`, {
+      lib,
       form: new URLSearchParams({
         md5,
         filename: file.filename,
@@ -461,7 +523,7 @@ export class LocalWriteClient {
       }),
       headers: { 'If-None-Match': '*' },
     });
-    if (!authorize.ok) await this.throwApi(authorize, `authorize upload for ${attachmentKey}`);
+    if (!authorize.ok) await this.throwApi(authorize, `authorize upload for ${attachmentKey}`, lib);
     const auth = (await authorize.json()) as { exists?: number; url?: string; uploadKey?: string };
     if (auth.exists) return; // identical file already stored
     if (!auth.url || !auth.uploadKey) throw new Error('Local API did not return an upload URL.');
@@ -479,16 +541,17 @@ export class LocalWriteClient {
     if (!up.ok) await this.throwApi(up, 'file-bytes upload');
     await up.body?.cancel().catch(() => {});
 
-    const register = await this.request('POST', `/users/0/items/${attachmentKey}/file`, {
+    const register = await this.request('POST', `/items/${attachmentKey}/file`, {
+      lib,
       form: new URLSearchParams({ upload: auth.uploadKey }),
       headers: { 'If-None-Match': '*' },
     });
-    if (!register.ok && register.status !== 204) await this.throwApi(register, 'register upload');
+    if (!register.ok && register.status !== 204) await this.throwApi(register, 'register upload', lib);
     await register.body?.cancel().catch(() => {});
   }
 
-  private async parseWriteResult(res: Response): Promise<WriteResult> {
-    if (!res.ok) await this.throwApi(res, 'local write');
+  private async parseWriteResult(res: Response, lib?: LibraryRef): Promise<WriteResult> {
+    if (!res.ok) await this.throwApi(res, 'local write', lib);
     const json = (await res.json().catch(() => ({}))) as any;
     const successful: WriteResult['successful'] = [];
     for (const [idx, obj] of Object.entries<any>(json.successful ?? {})) {
@@ -506,8 +569,38 @@ export class LocalWriteClient {
     };
   }
 
-  private async throwApi(res: Response, what: string): Promise<never> {
+  private async throwApi(res: Response, what: string, lib?: LibraryRef): Promise<never> {
     const body = await res.text().catch(() => '');
+    if (res.status === 403) {
+      const refusal = readOnlyRefusal(body, lib);
+      if (refusal) throw new ZoteroApiError({ status: 403, message: refusal, body });
+    }
     throw new ZoteroApiError({ status: res.status, message: `Local API ${what} failed (${res.status}): ${body.slice(0, 400)}`, body });
   }
+}
+
+/**
+ * What to say when the desktop refuses a write because it holds the library read-only, or
+ * null for any other 403.
+ *
+ * Zotero's own words are "Write access denied" and "File editing denied", which read like a
+ * missing key or a lost grant and would send a caller off to re-authorize. They are neither:
+ * the app checked the group's permissions, as synced from zotero.org, and this account may
+ * not edit that library (or its files). The same account is refused by the cloud for the
+ * same reason, so the message says what can change it and is deliberately worded so
+ * `isLocalWritesUnavailable` never reads it as a reason to try the cloud instead.
+ */
+export function readOnlyRefusal(body: string, lib?: LibraryRef): string | null {
+  const files = /file editing denied/i.test(body);
+  if (!files && !/write access denied/i.test(body)) return null;
+  const which = lib?.type === 'group' ? `group library ${lib.id}` : 'this library';
+  const what = files ? 'store files in' : 'edit';
+  return (
+    `The Zotero desktop app refused this write: your account may not ${what} ${which}. ` +
+    (lib?.type === 'group'
+      ? `The group's ${files ? 'File Editing' : 'Library Editing'} setting on zotero.org leaves you out (for example, admins only). ` +
+        'A group admin can change it; no API key or Zoteus setting overrides it.'
+      : 'Zotero holds it as read-only.') +
+    (files ? '' : ' Nothing was written.')
+  );
 }

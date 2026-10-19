@@ -15,7 +15,8 @@ import {
   requireBulkConfirm,
   requireCloud,
   isLocalWritesUnavailable,
-  ensureLocalApi,
+  desktopTakesWrites,
+  writesGoToDesktop,
   writeResult,
 } from '../registry/registry.js';
 import { CallerPathError, resolveCallerPath } from '../lib/caller-path.js';
@@ -700,19 +701,20 @@ async function saveResolved(ctx: ToolContext, args: any, payload: any[], source:
   }
   const lib = resolveLibrary(ctx, args);
   const personal = isPersonalLibrary(lib);
-  // Prefer the desktop app for the personal library (no cloud key needed);
-  // fall back to the cloud Web API otherwise.
+  // Prefer the desktop app for any library it holds (no cloud key needed): local-API writes
+  // for the personal library and the app's groups, the connector protocol for the personal
+  // library only. Fall back to the cloud Web API otherwise.
   //
   // What the local API answered when it refused every item of the batch, kept only while
   // the connector protocol is there to take the same items (#88); without it the result
   // stays the plain "Nothing succeeded" below.
   let localApiRejected: LocalApiRejection[] | undefined;
-  if (personal && (await ensureLocalApi(ctx)) && ctx.localWrites) {
+  if (ctx.localWrites && (await desktopTakesWrites(ctx, lib))) {
     try {
       if (args.collection_key) {
         for (const it of payload) it.collections = [...(it.collections ?? []), args.collection_key];
       }
-      const result = await ctx.localWrites.writeItems(payload);
+      const result = await ctx.localWrites.writeItems(payload, lib);
       if (ctx.connectorWrites && localApiRejectedEveryItem(result, payload.length)) {
         localApiRejected = result.failed.map(({ index, code, message }) => ({ index, code, message }));
         const first = localApiRejected[0]!;
@@ -720,14 +722,14 @@ async function saveResolved(ctx: ToolContext, args: any, payload: any[], source:
           `Local API rejected every item of the save (first: ${first.code} ${first.message}); saving them through the connector protocol instead.`,
         );
       } else {
-        return await completeLocalSave(ctx, args, payload, source, result);
+        return await completeLocalSave(ctx, lib, args, payload, source, result);
       }
     } catch (e) {
       if (!isLocalWritesUnavailable(e)) throw e;
       ctx.logger.info(`Local-API writes unavailable (${e instanceof Error ? e.message : e}); using the connector protocol.`);
     }
   }
-  if (personal && ctx.connectorWrites && (await ensureLocalApi(ctx))) {
+  if (personal && ctx.connectorWrites && (await writesGoToDesktop(ctx, lib))) {
     if (!localApiRejected) return saveThroughConnector(ctx, ctx.connectorWrites, args, payload, source);
     try {
       return await saveThroughConnector(ctx, ctx.connectorWrites, args, payload, source, localApiRejected);
@@ -842,6 +844,7 @@ function localApiRejectedEveryItem(result: WriteResult, attempted: number): bool
  */
 async function completeLocalSave(
   ctx: ToolContext,
+  lib: LibraryRef,
   args: any,
   payload: any[],
   source: string,
@@ -855,7 +858,7 @@ async function completeLocalSave(
       warning = `No item key came back from the save, so ${args.attach_url} was not attached.`;
     } else {
       try {
-        attached = await attachUrlLocally(ctx, created[0], args.attach_url, args.attach_title);
+        attached = await attachUrlLocally(ctx, lib, created[0], args.attach_url, args.attach_title);
       } catch (e) {
         const why = e instanceof Error ? e.message : String(e);
         ctx.logger.warn(`Attaching ${args.attach_url} to ${created[0]} failed: ${why}`);
@@ -994,19 +997,24 @@ function fetchAttachUrl(ctx: ToolContext, url: string, title?: string) {
  */
 async function attachUrlLocally(
   ctx: ToolContext,
+  lib: LibraryRef,
   parent: string,
   url: string,
   title?: string,
 ): Promise<{ key: string; bytes: number; contentType: string; filename: string }> {
   const { bytes, filename, contentType } = await fetchAttachUrl(ctx, url, title);
-  const key = await storeLocalAttachment(ctx, {
-    parent,
-    bytes,
-    filename,
-    contentType,
-    title: title ?? 'Full Text PDF',
-    url,
-  });
+  const key = await storeLocalAttachment(
+    ctx,
+    {
+      parent,
+      bytes,
+      filename,
+      contentType,
+      title: title ?? 'Full Text PDF',
+      url,
+    },
+    lib,
+  );
   return { key, bytes: bytes.length, contentType, filename };
 }
 

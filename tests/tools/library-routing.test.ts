@@ -313,7 +313,7 @@ describe('zotero_trash_items and zotero_delete_items follow the resolved library
       { item_keys: ['K1'], library_type: 'user', library_id: KEY_USER_ID },
       ctx,
     );
-    expect(localWrites.setDeleted).toHaveBeenCalledWith(['K1'], 1);
+    expect(localWrites.setDeleted).toHaveBeenCalledWith(['K1'], 1, { type: 'user', id: KEY_USER_ID });
     expect(web.writeItems).not.toHaveBeenCalled();
   });
 

@@ -363,13 +363,51 @@ export function resolveLibrary(ctx: ToolContext, args?: LibraryArgs): LibraryRef
 }
 
 /**
- * Whether the running desktop app can take a write for `lib`. Its local-API writes address
- * `/users/0` and the connector protocol saves into the library the app has open, so the
- * desktop only ever writes the personal library. A group, configured or explicit, is
- * cloud-only, and a desktop shortcut taken for one would land in the wrong library (#61).
+ * Whether `lib` is the personal library, the only one the connector protocol can write: it
+ * saves into whatever library the app has open, so a desktop shortcut taken through it for a
+ * group would land in the wrong library (#61). Local-API writes are not limited this way;
+ * ask `desktopTakesWrites` for those.
  */
 export function isPersonalLibrary(lib: LibraryRef): boolean {
   return lib.type === 'user';
+}
+
+/**
+ * Whether a write to `lib` goes to the running desktop app's local API (Zotero 10+) rather
+ * than to the cloud, decided the same way for every write tool: there is a local-API write
+ * client (not a hosted tenant, not `ZOTEUS_LOCAL=off`), and `writesGoToDesktop` says yes.
+ */
+export async function desktopTakesWrites(ctx: ToolContext, lib: LibraryRef): Promise<boolean> {
+  return Boolean(ctx.localWrites) && (await writesGoToDesktop(ctx, lib));
+}
+
+/**
+ * Whether writes to `lib` belong to the running desktop app at all, by whichever desktop
+ * protocol carries them (local-API writes, or the connector protocol for the personal
+ * library on Zotero 9 and earlier):
+ *
+ *   1. The app is up right now.
+ *   2. The app holds the library: the personal one always, a group only when it is in
+ *      `capabilities.localGroupIds`. Zotero 10.0.6 takes writes on `/api/groups/<id>/...`
+ *      exactly as on `/api/users/0/...`, but answers 404 for a group it does not have, and
+ *      that group's writes belong to the cloud. A group the app holds read-only is still
+ *      routed here, and the app's refusal (403 "Write access denied") is the answer, since
+ *      the cloud refuses the same account for the same reason.
+ *   3. No cloud write to that library is still waiting for the app to sync it. Reads of
+ *      such a library are held on the cloud until the app shows it holds that write
+ *      (`LibraryRouter.noteCloudWrite`), and its writes stay there too: a write sent to the
+ *      app meanwhile would be invisible to those reads, and would act on a copy that does
+ *      not yet have the change the cloud took (an update to an item the app has never seen
+ *      is a 404 there). Once the app catches up, reads and writes return to it together.
+ *
+ * Group ids are refreshed by `ensureLocalApi`, so this asks it first.
+ */
+export async function writesGoToDesktop(ctx: ToolContext, lib: LibraryRef): Promise<boolean> {
+  if (!(await ensureLocalApi(ctx))) return false;
+  if (lib.type === 'group' && !(ctx.capabilities.localGroupIds ?? []).includes(lib.id)) return false;
+  // Optional because hand-built test contexts carry a router with only the reads they use.
+  if (await ctx.router.awaitingDesktopSync?.(lib)) return false;
+  return true;
 }
 
 const KEY_SETTINGS_URL = 'https://www.zotero.org/settings/keys';
@@ -432,8 +470,8 @@ export function missingWriteAccess(
 
 /**
  * `lib`, once there is a cloud Web API to write it to AND the key is allowed to write it.
- * Group libraries (and any library the running desktop app cannot reach) are cloud-only,
- * so this throws a friendly error when no API key is configured, and a second, more
+ * Called once the desktop app has been ruled out for a write (`desktopTakesWrites`), so
+ * this throws a friendly error when no API key is configured, and a second, more
  * specific one when the key that is configured cannot write this particular library. Both
  * messages are surfaced to the model as an isError result.
  */
@@ -446,8 +484,11 @@ export function requireCloud(ctx: ToolContext, lib: LibraryRef): LibraryRef {
     // Which of the two it is now decides what the caller can do about it.
     throw new Error(
       lib.type === 'group'
-        ? `Writing to group library ${lib.id} needs a Zotero cloud API key with write access to that group (set ZOTERO_API_KEY; create one at ${KEY_SETTINGS_URL}). ` +
-          'The Zotero desktop app cannot stand in for it: its local API and the connector protocol both write your personal library only, so group writes always go through the cloud Web API, even for a group the desktop is holding.'
+        ? ctx.capabilities.localApi
+          ? `The running Zotero desktop app does not hold group library ${lib.id}, so it cannot take this write, and writing it through the cloud needs a Zotero cloud API key with write access to that group (set ZOTERO_API_KEY; create one at ${KEY_SETTINGS_URL}). ` +
+            'Check the id with zotero_groups; a group joined recently appears in the app after its next sync.'
+          : `Writing to group library ${lib.id} needs either the Zotero desktop app running (Zotero 10 or newer, with that group synced into it) or a Zotero cloud API key with write access to that group (set ZOTERO_API_KEY; create one at ${KEY_SETTINGS_URL}). ` +
+            'Neither is available right now: the app is not reachable on this machine and no key is configured.'
         : ctx.capabilities.localApi
           ? `This operation is cloud-only in Zoteus: it writes your personal library through the Zotero Web API, which needs a cloud API key (set ZOTERO_API_KEY; create one at ${KEY_SETTINGS_URL}). ` +
             'The running Zotero desktop app cannot take this particular write.'
@@ -609,6 +650,11 @@ export function registerAllTools(
 export function isLocalWritesUnavailable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   if (/denied/i.test(msg)) return false;
+  // A 400 is the desktop judging what the request asked for, which only a desktop that takes
+  // writes does. Measured on 10.0.6: full text for a text/plain attachment answers 400 "Full-
+  // text content is not supported for this item type", whose "not supported" sent a keyless
+  // caller a refusal about Zotero versions and grants, and would send a keyed one to the cloud.
+  if (/\bfailed \(400\)/.test(msg)) return false;
   return (
     /local api/i.test(msg) &&
     /\b401\b|expired api key|404|no endpoint|not implemented|not supported|does not support|unreachable/i.test(

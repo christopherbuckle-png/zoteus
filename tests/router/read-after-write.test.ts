@@ -197,3 +197,40 @@ describe('reads after a cloud write', () => {
     expect(local.objectVersion).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Writes now go to the desktop for every library it holds, groups included. A library whose
+ * reads are held on the cloud by an unsynced cloud write keeps its writes there as well, so
+ * the write tools ask the router before choosing the desktop.
+ */
+describe('awaitingDesktopSync, the write side of the same rule', () => {
+  it('is false for a library nobody wrote to on the cloud, and asks the desktop nothing', async () => {
+    const { router, local } = makeRouter();
+    expect(await router.awaitingDesktopSync(group)).toBe(false);
+    expect(await router.awaitingDesktopSync({ type: 'user', id: 0 })).toBe(false);
+    expect(local.objectVersion).not.toHaveBeenCalled();
+  });
+
+  it('holds a group while its cloud write is unsynced, and releases it (for reads too) once the desktop has it', async () => {
+    const held: Record<string, number | null> = {};
+    const { router, local } = makeRouter(held);
+    router.noteCloudWrite(group, 'items', ['NEWITEM1']);
+    await settle();
+    expect(await router.awaitingDesktopSync(group)).toBe(true);
+
+    held.NEWITEM1 = 12;
+    expect(await router.awaitingDesktopSync(group)).toBe(false);
+    // The entry is retired, so the next read goes to the desktop without asking again.
+    local.objectVersion.mockClear();
+    expect((await router.getItem('NEWITEM1', { library: group })).key).toBe('LOCAL');
+    expect(local.objectVersion).not.toHaveBeenCalled();
+  });
+
+  it('never holds a library the desktop does not serve: there is no desktop write to keep away from it', async () => {
+    const { router } = makeRouter();
+    const elsewhere = { type: 'group' as const, id: 999 };
+    router.noteCloudWrite(elsewhere, 'items', ['K']);
+    await settle();
+    expect(await router.awaitingDesktopSync(elsewhere)).toBe(false);
+  });
+});

@@ -5,10 +5,9 @@ import { libraryArgs } from './common-args.js';
 import {
   ok,
   resolveLibrary,
-  isPersonalLibrary,
   requireCloud,
   isLocalWritesUnavailable,
-  ensureLocalApi,
+  desktopTakesWrites,
   requireBulkConfirm,
   writeResult,
 } from '../registry/registry.js';
@@ -21,7 +20,7 @@ const trashItems: ToolDefinition = {
   name: 'zotero_trash_items',
   title: 'Trash or restore Zotero items',
   description:
-    'Move items to the trash (the safe, REVERSIBLE default) or restore them. This sets the `deleted` flag (1=trash, 0=restore) — it is NOT a permanent delete, so trashed items can be recovered here or in the Zotero app. Use this instead of zotero_delete_items unless you truly need irreversible removal. Provide `item_keys` and optional `action` (default "trash"). Writes go to the running Zotero desktop app for your personal library (via its local-API writes where available), otherwise to the cloud Web API. When the server sets a bulk-write threshold (ZOTEUS_CONFIRM_BULK_WRITES, off by default), trashing more items than that in one call also needs `confirm: true`.',
+    'Move items to the trash (the safe, REVERSIBLE default) or restore them. This sets the `deleted` flag (1=trash, 0=restore); it is NOT a permanent delete, so trashed items can be recovered here or in the Zotero app. Use this instead of zotero_delete_items unless you truly need irreversible removal. Provide `item_keys` and optional `action` (default "trash"). Writes go to the running Zotero desktop app (its local-API writes, Zotero 10+) for your personal library and for any group library the app holds, otherwise to the cloud Web API. When the server sets a bulk-write threshold (ZOTEUS_CONFIRM_BULK_WRITES, off by default), trashing more items than that in one call also needs `confirm: true`.',
   inputSchema: {
     item_keys: z.array(z.string()).min(1).describe('Item keys to trash or restore.'),
     action: z.enum(['trash', 'restore']).optional().describe('Default "trash".'),
@@ -48,12 +47,12 @@ const trashItems: ToolDefinition = {
       if (refusal) return refusal;
     }
     const lib = resolveLibrary(ctx, args);
-    // Local-first for the personal library when the desktop app supports writes.
-    if (ctx.localWrites && isPersonalLibrary(lib) && (await ensureLocalApi(ctx))) {
+    // Local-first for any library the desktop app holds, when it supports writes.
+    if (ctx.localWrites && (await desktopTakesWrites(ctx, lib))) {
       try {
         // Set the `deleted` flag rather than issuing a DELETE: the local API's DELETE,
         // like the Web API's, erases items outright, which is not what "trash" means.
-        const result = await ctx.localWrites.setDeleted(args.item_keys, deleted);
+        const result = await ctx.localWrites.setDeleted(args.item_keys, deleted, lib);
         const updated = [...result.successful.map((s) => s.key), ...result.unchanged];
         return writeResult(
           { updated, failed: result.failed, target: 'local' },
