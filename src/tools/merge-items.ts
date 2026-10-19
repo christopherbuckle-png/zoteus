@@ -4,7 +4,6 @@ import {
   LIBRARY_CONTENT_PROVENANCE,
   okLibraryContent,
   requireBulkConfirm,
-  requireCloudLibrary,
   resolveLibrary,
   writeResult,
 } from '../registry/registry.js';
@@ -12,6 +11,7 @@ import { libraryArgs } from './common-args.js';
 import { provenance, writeFailures, writeTarget } from './common-output.js';
 import { ZoteroApiError } from '../api/errors.js';
 import type { LibraryRef, ListResult } from '../api/web-client.js';
+import { mustFallBack, withLibraryWriter, type LibraryWriter } from './library-writer.js';
 import {
   buildMergePlan,
   type ChildRecord,
@@ -71,13 +71,20 @@ function isMergeableRecord(item: ItemRecord): boolean {
  * The Zotero URI of an item, which is what the `relations` field holds.
  *
  * `users/0` is how the desktop app addresses the personal library when no cloud key is
- * configured, and it is not a URI any other Zotero would recognise, so the cloud user id is
- * preferred whenever one is known.
+ * configured, and it is not a URI any other Zotero would recognise, so the real user id is
+ * preferred whenever one is known: the cloud key's, or else the one the desktop app reports
+ * on its own records (`library.id`, the account it syncs as).
  */
-function itemUriFor(ctx: ToolContext, lib: LibraryRef): (key: string) => string {
-  const id = lib.type === 'user' && !lib.id ? (ctx.capabilities.cloud?.userID ?? 0) : lib.id;
+function itemUriFor(ctx: ToolContext, lib: LibraryRef, desktopUserId?: number): (key: string) => string {
+  const id = lib.type === 'user' && !lib.id ? (ctx.capabilities.cloud?.userID ?? desktopUserId ?? 0) : lib.id;
   const base = `http://zotero.org/${lib.type === 'group' ? 'groups' : 'users'}/${id}/items/`;
   return (key: string) => base + key;
+}
+
+/** The account id the desktop app reports on a personal-library record, if it syncs as one. */
+function recordUserId(item: any): number | undefined {
+  const lib = item?.library;
+  return lib?.type === 'user' && Number.isSafeInteger(lib.id) && lib.id > 0 ? lib.id : undefined;
 }
 
 /** Reading the records a plan is computed from, from one backend and one only. */
@@ -116,45 +123,62 @@ async function allChildren(readPage: (start: number, limit: number) => Promise<L
 }
 
 /**
- * Both paths read the cloud Web API, because that is where the merge writes: a preview
- * computed from the desktop app's copy while the write is computed from the cloud's is a
- * preview of a different merge (an unsynced abstract makes the plan fill a field the caller
- * was shown as occupied, an unsynced attachment makes it promise a reparenting that never
- * happens). The desktop is read only when no merge could be applied here at all, and the
- * answer then says which copy it described.
+ * Preview and write both read the copy the merge WRITES to, through the writer: the desktop
+ * app's when it takes this library's writes, the cloud's otherwise. A preview computed from
+ * one copy while the write is computed from the other is a preview of a different merge (an
+ * unsynced abstract makes the plan fill a field the caller was shown as occupied, an
+ * unsynced attachment makes it promise a reparenting that never happens), and the versions
+ * a plan carries mean nothing to the other API.
  */
-function routedReader(ctx: ToolContext, lib: LibraryRef): Reader {
+function writerReader(writer: LibraryWriter): Reader {
   return {
-    getItem: (key) => ctx.router.getItem(key, { library: lib }),
-    getChildren: (key) => allChildren((start, limit) => ctx.router.getItemChildren(key, { library: lib, start, limit })),
+    getItem: (key) => writer.getItem(key),
+    getChildren: (key) => allChildren((start, limit) => writer.getChildren(key, { start, limit })),
   };
 }
 
-function cloudReader(ctx: ToolContext, lib: LibraryRef): Reader {
+/**
+ * The OTHER copy, asked only for a second opinion on which children hang off a duplicate:
+ * the desktop app's when the merge writes to the cloud, the cloud's when it writes to the
+ * desktop. Null when there is no other copy to ask.
+ */
+function otherCopy(ctx: ToolContext, writer: LibraryWriter): { reader: Reader; name: string; missingFrom: string } | null {
+  const lib = writer.lib;
+  if (writer.target === 'cloud') {
+    if (!ctx.router.servesLocally(lib)) return null;
+    return {
+      name: 'The Zotero desktop app',
+      missingFrom: 'the cloud copy does not have yet',
+      reader: {
+        getItem: (key) => ctx.router.getItem(key, { library: lib }),
+        getChildren: (key) => allChildren((start, limit) => ctx.router.getItemChildren(key, { library: lib, start, limit })),
+      },
+    };
+  }
+  if (!ctx.capabilities.cloud) return null;
   return {
-    getItem: (key) => ctx.web.getItem(lib, key),
-    getChildren: (key) => allChildren((start, limit) => ctx.web.getItemChildren(lib, key, { start, limit })),
+    name: 'The Zotero cloud',
+    missingFrom: 'the desktop app does not have yet',
+    reader: {
+      getItem: (key) => ctx.web.getItem(lib, key),
+      getChildren: (key) => allChildren((start, limit) => ctx.web.getItemChildren(lib, key, { start, limit })),
+    },
   };
 }
 
 /** Retry metadata conflicts only while the child still belongs to the planned duplicate. */
-async function reparentChild(
-  ctx: ToolContext,
-  lib: LibraryRef,
-  child: ChildRecord,
-  masterKey: string,
-): Promise<number> {
+async function reparentChild(writer: LibraryWriter, child: ChildRecord, masterKey: string): Promise<number> {
   const patch = { parentItem: masterKey };
   try {
-    return await ctx.web.patchItem(lib, child.key, patch, child.version!);
+    return await writer.patchItem(child.key, patch, child.version!);
   } catch (e) {
     if (!(e instanceof ZoteroApiError) || e.status !== 412) throw e;
-    const fresh = toRecord(await ctx.web.getItem(lib, child.key));
+    const fresh = toRecord(await writer.getItem(child.key));
     if (!fresh || fresh.version == null) throw e;
     if (fresh.data.deleted || fresh.data.parentItem !== child.from) {
       throw new Error(`Child ${child.key} was deleted or moved to a different parent during the merge; its new state was preserved.`);
     }
-    return await ctx.web.patchItem(lib, child.key, patch, fresh.version);
+    return await writer.patchItem(child.key, patch, fresh.version);
   }
 }
 
@@ -180,23 +204,22 @@ interface MasterPatched {
  * told the plan it gets back is the rebuilt one.
  */
 async function patchMaster(
-  ctx: ToolContext,
-  lib: LibraryRef,
+  writer: LibraryWriter,
   key: string,
   patch: Record<string, unknown>,
   version: number,
   rebuild: (master: ItemRecord) => { plan: MergePlan; patch: Record<string, unknown> },
 ): Promise<MasterPatched> {
   try {
-    return { version: await ctx.web.patchItem(lib, key, patch, version) };
+    return { version: await writer.patchItem(key, patch, version) };
   } catch (e) {
     if (!(e instanceof ZoteroApiError) || e.status !== 412) throw e;
-    const fresh = toRecord(await ctx.web.getItem(lib, key));
+    const fresh = toRecord(await writer.getItem(key));
     if (!fresh || fresh.version == null) throw e;
     if (!isMergeableRecord(fresh)) throw new Error(`Merge target ${key} is no longer an active top-level bibliographic item; retry after reviewing it.`);
     const replanned = rebuild(fresh);
     return {
-      version: await ctx.web.patchItem(lib, key, replanned.patch, fresh.version),
+      version: await writer.patchItem(key, replanned.patch, fresh.version),
       replanned,
     };
   }
@@ -316,7 +339,7 @@ const mergeItems: ToolDefinition = {
   name: 'zotero_merge_items',
   title: 'Merge duplicate items',
   description:
-    'Merge one or more duplicate items into a master item: fields the master is MISSING are filled from the duplicates, their tags, collections and relations are unioned onto it, their child notes and attachments are reparented to it, and the emptied duplicates are moved to the trash (recoverable). A field the master already has is never overwritten, and nothing is ever deleted outright. PREVIEWS BY DEFAULT: with `dry_run` unset or true nothing is written and the answer is the exact plan, field by field, so the caller can see what would change before it changes. Pass `dry_run:false` to execute. The writing path uses the Zotero cloud Web API and needs ZOTERO_API_KEY, because only that API takes a versioned PATCH, and the preview reads the same cloud records the write will act on so the two cannot describe different merges; on a desktop-only install the preview instead describes the desktop app\'s copy and says so (`readFrom`), since no merge can be applied there at all. The preview also reports `versions` (the master\'s, each duplicate\'s and each child\'s): pass that block back as `expect_versions` with dry_run:false and the write runs only if every record is still at that version, otherwise NOTHING is written and the answer is the plan as it now stands, as a dry run, with `changed` naming what moved. Without `expect_versions` the write plans from the records as they are at call time. If the master changes on the server between the read and the PATCH inside one call, the plan is rebuilt against the record as it then is rather than replayed, and the answer says so (`replanned`), because replaying it would overwrite exactly what changed. Find candidates with zotero_import `check_duplicates:true`, or by comparing records yourself with zotero_search_items and zotero_get_item. The master keeps its own key, so citations already pointing at it stay valid; the duplicates keep theirs in the trash until it is emptied, and the master records a dc:replaces relation naming each item it absorbed, which is the same relation Zotero\'s own merge writes. Put a duplicate back with zotero_trash_items action:"restore"; to edit one item rather than fold two together, use zotero_update_item.',
+    'Merge one or more duplicate items into a master item: fields the master is MISSING are filled from the duplicates, their tags, collections and relations are unioned onto it, their child notes and attachments are reparented to it, and the emptied duplicates are moved to the trash (recoverable). A field the master already has is never overwritten, and nothing is ever deleted outright. PREVIEWS BY DEFAULT: with `dry_run` unset or true nothing is written and the answer is the exact plan, field by field, so the caller can see what would change before it changes. Pass `dry_run:false` to execute. The merge runs on the running Zotero desktop app (Zotero 10+, no cloud key needed) for your personal library and any group library the app holds, and on the cloud Web API (ZOTERO_API_KEY with write access) otherwise; the preview reads the same copy the write will act on, so the two cannot describe different merges, and says which (`readFrom`). The preview also reports `versions` (the master\'s, each duplicate\'s and each child\'s): pass that block back as `expect_versions` with dry_run:false and the write runs only if every record is still at that version, otherwise NOTHING is written and the answer is the plan as it now stands, as a dry run, with `changed` naming what moved. Without `expect_versions` the write plans from the records as they are at call time. If the master changes between the read and the PATCH inside one call, the plan is rebuilt against the record as it then is rather than replayed, and the answer says so (`replanned`), because replaying it would overwrite exactly what changed. Find candidates with zotero_import `check_duplicates:true`, or by comparing records yourself with zotero_search_items and zotero_get_item. The master keeps its own key, so citations already pointing at it stay valid; the duplicates keep theirs in the trash until it is emptied, and the master records a dc:replaces relation naming each item it absorbed, which is the same relation Zotero\'s own merge writes. Put a duplicate back with zotero_trash_items action:"restore"; to edit one item rather than fold two together, use zotero_update_item.',
   inputSchema: {
     master_key: z.string().describe('8-character key of the item to keep. It keeps its key, so existing citations to it stay valid.'),
     duplicate_keys: z
@@ -389,7 +412,7 @@ const mergeItems: ToolDefinition = {
       replanned: z
         .boolean()
         .optional()
-        .describe('True when the master changed on the server between the read and the write: the plan was rebuilt against the record as it then was, so `plan` is what was actually written rather than what a preview showed.'),
+        .describe('True when the master changed between the read and the write: the plan was rebuilt against the record as it then was, so `plan` is what was actually written rather than what a preview showed.'),
       versions: z
         .object({
           master: z.number().optional().describe("The master's version the plan was computed from."),
@@ -415,11 +438,11 @@ const mergeItems: ToolDefinition = {
       readFrom: z
         .string()
         .optional()
-        .describe('Which copy of the library the plan was computed from: "cloud" (the Zotero Web API, which is also where a merge writes) or "local" (the running desktop app, only on a server with no cloud key, where no merge can be applied at all).'),
+        .describe('Which copy of the library the plan was computed from, which is also the copy a merge writes to: "local" (the running Zotero desktop app, for any library it holds) or "cloud" (the Zotero Web API).'),
       note: z
         .string()
         .optional()
-        .describe('Anything the caller should know before acting on this answer, e.g. that applying it needs a cloud API key.'),
+        .describe('Anything the caller should know before acting on this answer, e.g. that the library moved since the preview being approved.'),
       target: writeTarget,
       failed: writeFailures,
       provenance,
@@ -441,312 +464,312 @@ const mergeItems: ToolDefinition = {
       );
     }
 
-    let lib: LibraryRef;
-    // Whether the plan is computed from the desktop app's copy instead of the cloud's. Only
-    // ever true for a preview on a server that could not apply a merge at all, so the plan a
-    // caller approves is always the plan the write executes.
-    let previewFromDesktop = false;
-    if (dryRun) {
-      try {
-        lib = requireCloudLibrary(ctx, args);
-      } catch {
-        lib = resolveLibrary(ctx, args);
-        previewFromDesktop = true;
-      }
-    } else {
-      try {
-        lib = requireCloudLibrary(ctx, args);
-      } catch (e) {
-        return err(
-          `${message(e)} A merge PATCHes the master and each child item with the version it read, and only the ` +
-            'cloud Web API takes a version, so this tool cannot fall back to the desktop app. The preview ' +
-            '(dry_run:true) works without a key.',
-        );
-      }
-    }
-
-    const read = previewFromDesktop ? routedReader(ctx, lib) : cloudReader(ctx, lib);
-    const failed: { key?: string; code?: number; message?: string }[] = [];
-
-    let master: ItemRecord | undefined;
-    try {
-      master = toRecord(await read.getItem(masterKey));
-    } catch (e) {
-      return err(`Could not read the master item ${masterKey}: ${message(e)}`);
-    }
-    if (!master) return err(`No item ${masterKey} in this library, so there is nothing to merge into.`);
-    if (!isMergeableRecord(master)) return err(`Item ${masterKey} is not an active top-level bibliographic item. Notes, attachments, annotations and trashed items cannot be merge targets; nothing was written.`);
-
-    const duplicates: ItemRecord[] = [];
-    for (const key of duplicateKeys) {
-      try {
-        const rec = toRecord(await read.getItem(key));
-        if (rec && !isMergeableRecord(rec)) {
-          failed.push({ key, message: `Item ${key} is not an active top-level bibliographic item, so it was excluded from the merge.` });
-        } else if (rec) duplicates.push(rec);
-        else failed.push({ key, message: `No item ${key} in this library.` });
-      } catch (e) {
-        failed.push({ key, code: statusOf(e), message: `Could not read ${key}: ${message(e)}` });
-      }
-    }
-    if (!duplicates.length) {
-      return err(
-        `None of the duplicates could be read (${failed.map((f) => f.message).join(' ')}), so no plan could be built and nothing was written.`,
-      );
-    }
-
-    // A duplicate whose children could not be listed must not be trashed: an attachment left
-    // hanging off it would go into the trash with it.
-    const unsafeToTrash = new Set<string>();
-    const children: ChildRecord[] = [];
-    for (const dup of duplicates) {
-      try {
-        for (const raw of await read.getChildren(dup.key)) {
-          const child = toChild(raw, dup.key);
-          if (child) children.push(child);
-        }
-      } catch (e) {
-        unsafeToTrash.add(dup.key);
-        failed.push({
-          key: dup.key,
-          code: statusOf(e),
-          message: `Could not list the child items of ${dup.key} (${message(e)}), so it was left out of the trash.`,
-        });
-      }
-    }
-
-    // The write goes to the cloud, but the desktop app may still be holding a child the
-    // cloud has never seen: an attachment saved locally a minute ago hangs off the duplicate
-    // there and nowhere else, and trashing its parent would take it along at the next sync.
-    // So when the desktop serves this library it gets asked too, purely as a veto on the
-    // trashing. Best effort: a desktop that will not answer must not stop a merge the cloud
-    // can complete by itself.
-    if (!previewFromDesktop && ctx.router.servesLocally(lib)) {
-      for (const dup of duplicates) {
-        try {
-          const seen = new Set(children.filter((c) => c.from === dup.key).map((c) => c.key));
-          const localOnly = (await routedReader(ctx, lib).getChildren(dup.key))
-            .map((raw) => toChild(raw, dup.key))
-            .filter((c): c is ChildRecord => !!c && !seen.has(c.key));
-          if (!localOnly.length) continue;
-          unsafeToTrash.add(dup.key);
-          failed.push({
-            key: dup.key,
-            message:
-              `The Zotero desktop app lists ${localOnly.length} child item(s) on ${dup.key} that the cloud copy ` +
-              `does not have yet (${localOnly.map((c) => c.key).join(', ')}), so ${dup.key} was left out of the ` +
-              'trash: trashing it now would take them with it once the desktop syncs. Let Zotero finish syncing ' +
-              '(zotero_sync) and merge again.',
-          });
-        } catch {
-          // The desktop is a second opinion here, not the source of truth.
-        }
-      }
-    }
-
-    // What the plan is computed from, so a caller can hand it back and approve THIS plan and
-    // not whatever a later read produces.
-    const versions = planVersions(master, duplicates, children);
-
-    const rules = await fieldRules(ctx, master.data.itemType);
-    const planFor = (m: ItemRecord): { plan: MergePlan; patch: Record<string, unknown> } =>
-      buildMergePlan({
-        master: m,
-        duplicates,
-        children,
-        itemUri: itemUriFor(ctx, lib),
-        unsafeToTrash,
-        ...rules,
-      });
-    // Rebuilt in place if the master turns out to have moved under the merge; `structured()`
-    // and the summary both read these at return time, so the caller is shown what was written.
-    let { plan, patch } = planFor(master);
-    const filled = (): string =>
-      `${Object.keys(plan.fields).length} field(s), ${plan.tagsAdded.length} tag(s) and ${plan.collectionsAdded.length} collection(s)`;
-
-    if (dryRun) {
-      const note = previewFromDesktop
-        ? 'This preview describes the copy in the running Zotero desktop app, not the cloud, because this server ' +
-          'cannot apply a merge to this library at all: applying one needs a Zotero cloud API key ' +
-          '(ZOTERO_API_KEY) with write access to it, since the desktop local API has no versioned PATCH and the ' +
-          'write path is the Web API only.'
-        : undefined;
-      return okLibraryContent(
-        {
-          master_key: masterKey,
-          dryRun: true,
-          plan,
-          versions,
-          readFrom: previewFromDesktop ? 'local' : 'cloud',
-          note,
-          failed: failed.length ? failed : undefined,
-        },
-        `Dry run: merging ${duplicates.length} item(s) into ${masterKey} would fill ${filled()}, ` +
-          `move ${plan.childrenToMove.length} child item(s), and trash ${plan.duplicatesToTrash.length} item(s). ` +
-          'Nothing was written. To run exactly this plan, pass `versions` back as `expect_versions` with dry_run:false.' +
-          (plan.fieldsSkipped.length ? ` ${plan.fieldsSkipped.length} value(s) would be left behind; see plan.fieldsSkipped.` : '') +
-          (failed.length ? ` ${failed.length} item(s) could not be planned in full; see failed.` : '') +
-          (note ? ` ${note}` : ''),
-      );
-    }
-
-    // The plan that was approved is the plan that runs, and this is what makes that true
-    // across two calls: the write is refused, and the fresh plan handed back as a preview,
-    // when any record the caller's preview was computed from has moved since.
-    const changed = args.expect_versions ? staleSince(args.expect_versions as ExpectedVersions, versions, masterKey) : [];
-    if (changed.length) {
-      const note =
-        'Nothing was written: the library moved since the preview that `expect_versions` describes, so that plan ' +
-        'is no longer the plan. This answer is the plan as it now stands; review it and pass its `versions` as ' +
-        '`expect_versions` to run it.';
-      return okLibraryContent(
-        {
-          master_key: masterKey,
-          dryRun: true,
-          plan,
-          versions,
-          changed,
-          readFrom: 'cloud',
-          note,
-          failed: failed.length ? failed : undefined,
-        },
-        `Nothing was written: ${changed.length} record(s) changed since the preview (${changed.map(describeChange).join('; ')}). ` +
-          `Merging ${duplicates.length} item(s) into ${masterKey} would NOW fill ${filled()}, ` +
-          `move ${plan.childrenToMove.length} child item(s), and trash ${plan.duplicatesToTrash.length} item(s); ` +
-          'review this plan and pass its `versions` back as `expect_versions` to run it.' +
-          (plan.fieldsSkipped.length ? ` ${plan.fieldsSkipped.length} value(s) would be left behind; see plan.fieldsSkipped.` : '') +
-          (failed.length ? ` ${failed.length} item(s) could not be planned in full; see failed.` : ''),
-      );
-    }
-
-    const attempted = 1 + children.length + duplicates.length;
-    // Gated here rather than on `duplicate_keys` alone: this call PATCHes the master and
-    // every child as well as trashing the duplicates, and a gate that counts two of those
-    // and ignores a hundred is not the gate the operator switched on.
-    const refusal = requireBulkConfirm(ctx, attempted, 'merge', args.confirm);
-    if (refusal) return refusal;
-    let replanned = false;
-    const structured = (extra: Record<string, unknown>): Record<string, unknown> => ({
-      master_key: masterKey,
-      dryRun: false,
-      plan,
-      readFrom: 'cloud',
-      ...(replanned ? { replanned: true } : {}),
-      target: 'cloud',
-      failed,
-      provenance: LIBRARY_CONTENT_PROVENANCE,
-      ...extra,
-    });
-
-    if (master.version == null) {
-      return err(
-        `Could not determine the current version of ${masterKey}, and a merge will not PATCH without one. Nothing was written.`,
-      );
-    }
-
-    let masterVersion: number;
-    try {
-      const written = await patchMaster(ctx, lib, masterKey, patch, master.version, planFor);
-      masterVersion = written.version;
-      if (written.replanned) {
-        replanned = true;
-        plan = written.replanned.plan;
-        patch = written.replanned.patch;
-      }
-    } catch (e) {
-      failed.push({ key: masterKey, code: statusOf(e), message: `Updating the master failed: ${message(e)}` });
-      // Nothing downstream ran, so the plan must not go on claiming a trashing that will
-      // now never happen.
-      plan.duplicatesToTrash = [];
-      return writeResult(
-        structured({ applied: { childrenMoved: [], trashed: [] } }),
-        `Merging into ${masterKey} stopped at the first step: the master could not be updated, so no child item was moved and nothing was trashed.`,
-        0,
-        attempted,
-        failed,
-      );
-    }
-
-    const childrenMoved: string[] = [];
-    for (const child of children) {
-      if (child.version == null) {
-        unsafeToTrash.add(child.from);
-        failed.push({ key: child.key, message: `No version for child ${child.key}, so it was not reparented.` });
-        continue;
-      }
-      try {
-        await reparentChild(ctx, lib, child, masterKey);
-        childrenMoved.push(child.key);
-      } catch (e) {
-        const status = statusOf(e);
-        unsafeToTrash.add(child.from);
-        failed.push({
-          key: child.key,
-          code: status,
-          message:
-            `Reparenting ${child.key} onto ${masterKey} failed: ${message(e)}` +
-            (status === 400 || status === 403
-              ? ' The API refused a parentItem change on an existing child item.'
-              : '') +
-            ` ${child.from} was left out of the trash so the child is not trashed with it.`,
-        });
-      }
-    }
-
-    const trashable = duplicates.filter((d) => !unsafeToTrash.has(d.key) && d.version != null);
-    // A reparenting failure above can rule a duplicate out after the plan was built, so the
-    // plan is brought back into line with what this run has actually decided to do before it
-    // is handed back next to the failures that decided it.
-    plan.duplicatesToTrash = trashable.map((d) => d.key);
-    for (const d of duplicates) {
-      if (!unsafeToTrash.has(d.key) && d.version == null) {
-        failed.push({ key: d.key, message: `No version for ${d.key}, so it was not trashed.` });
-      }
-    }
-    const trashed: string[] = [];
-    // Recheck immediately before each trash write. The original item version does not
-    // protect against a new child: creating one need not change its parent's version.
-    // The library version on the final POST closes the gap after this empty-child read.
-    for (const duplicate of trashable) {
-      try {
-        const remaining = await ctx.web.getItemChildren(lib, duplicate.key, { limit: 1 });
-        if (remaining.data.length || remaining.totalResults > 0) {
-          throw new Error('Child items remain or appeared during the merge; retry after reviewing them.');
-        }
-        if (!Number.isSafeInteger(remaining.lastModifiedVersion) || remaining.lastModifiedVersion <= 0) {
-          throw new Error('The child listing did not supply a library version, so an empty parent could not be safely confirmed.');
-        }
-        const result = await ctx.web.writeItems(
-          lib,
-          [{ key: duplicate.key, version: duplicate.version, deleted: 1 }],
-          { libraryVersion: remaining.lastModifiedVersion },
-        );
-        trashed.push(...result.successful.map((s) => s.key), ...result.unchanged);
-        failed.push(...result.failed);
-      } catch (e) {
-        failed.push({ key: duplicate.key, code: statusOf(e), message: `Trashing ${duplicate.key} was refused: ${message(e)}` });
-      }
-    }
-    plan.duplicatesToTrash = [...trashed];
-
-    const succeeded = 1 + childrenMoved.length + trashed.length;
-    const left = duplicates.length - trashed.length;
-    return writeResult(
-      structured({ applied: { masterVersion, childrenMoved, trashed } }),
-      `Merged ${trashed.length} of ${duplicates.length} duplicate(s) into ${masterKey}: filled ${filled()}, ` +
-        `moved ${childrenMoved.length} of ${children.length} child item(s).` +
-        (replanned
-          ? ` ${masterKey} changed on the server while this merge was being planned, so the plan was rebuilt` +
-            ' against the record as it then was and `plan` describes what was written, not what a preview showed.'
-          : '') +
-        (left
-          ? ` ${left} duplicate(s) stayed in the library because something on them did not move; see failed.`
-          : ' The merged duplicates are in the Zotero trash and can be restored from there.'),
-      succeeded,
-      attempted,
-      failed,
+    return withLibraryWriter(ctx, resolveLibrary(ctx, args), (writer) =>
+      runMerge(ctx, args, writer, masterKey, duplicateKeys, dryRun),
     );
   },
 };
+
+/**
+ * One merge, planned and (unless `dryRun`) applied on ONE copy of the library: the one
+ * `writer` writes to. Every read the plan rests on, every version it sends and the final
+ * library-version pin come from that same API, which is what keeps the consistency
+ * guarantees below true on the desktop app as much as on the cloud: the desktop's versions
+ * are its own `clientVersion`s and mean nothing to the cloud, and the other way round.
+ *
+ * Throws `LocalWritesUnavailableError` only from the master's PATCH, the first write, so
+ * `withLibraryWriter` can re-run the whole merge on the cloud with nothing yet written.
+ */
+async function runMerge(
+  ctx: ToolContext,
+  args: any,
+  writer: LibraryWriter,
+  masterKey: string,
+  duplicateKeys: string[],
+  dryRun: boolean,
+): Promise<ToolHandlerResult> {
+  const lib = writer.lib;
+  const read = writerReader(writer);
+  const failed: { key?: string; code?: number; message?: string }[] = [];
+
+  let rawMaster: any;
+  try {
+    rawMaster = await read.getItem(masterKey);
+  } catch (e) {
+    return err(`Could not read the master item ${masterKey}: ${message(e)}`);
+  }
+  const master = toRecord(rawMaster);
+  if (!master) return err(`No item ${masterKey} in this library, so there is nothing to merge into.`);
+  if (!isMergeableRecord(master)) return err(`Item ${masterKey} is not an active top-level bibliographic item. Notes, attachments, annotations and trashed items cannot be merge targets; nothing was written.`);
+
+  const duplicates: ItemRecord[] = [];
+  for (const key of duplicateKeys) {
+    try {
+      const rec = toRecord(await read.getItem(key));
+      if (rec && !isMergeableRecord(rec)) {
+        failed.push({ key, message: `Item ${key} is not an active top-level bibliographic item, so it was excluded from the merge.` });
+      } else if (rec) duplicates.push(rec);
+      else failed.push({ key, message: `No item ${key} in this library.` });
+    } catch (e) {
+      failed.push({ key, code: statusOf(e), message: `Could not read ${key}: ${message(e)}` });
+    }
+  }
+  if (!duplicates.length) {
+    return err(
+      `None of the duplicates could be read (${failed.map((f) => f.message).join(' ')}), so no plan could be built and nothing was written.`,
+    );
+  }
+
+  // A duplicate whose children could not be listed must not be trashed: an attachment left
+  // hanging off it would go into the trash with it.
+  const unsafeToTrash = new Set<string>();
+  const children: ChildRecord[] = [];
+  for (const dup of duplicates) {
+    try {
+      for (const raw of await read.getChildren(dup.key)) {
+        const child = toChild(raw, dup.key);
+        if (child) children.push(child);
+      }
+    } catch (e) {
+      unsafeToTrash.add(dup.key);
+      failed.push({
+        key: dup.key,
+        code: statusOf(e),
+        message: `Could not list the child items of ${dup.key} (${message(e)}), so it was left out of the trash.`,
+      });
+    }
+  }
+
+  // The write goes to one copy, but the other may still be holding a child this one has
+  // never seen: an attachment saved in the desktop app a minute ago hangs off the duplicate
+  // there and nowhere else, and one added on another computer is on the cloud and not yet in
+  // this desktop. Trashing the parent here would take that child along at the next sync. So
+  // when the other copy can be asked it is, purely as a veto on the trashing. Best effort: a
+  // copy that will not answer must not stop a merge this one can complete by itself.
+  const other = otherCopy(ctx, writer);
+  if (other) {
+    for (const dup of duplicates) {
+      try {
+        const seen = new Set(children.filter((c) => c.from === dup.key).map((c) => c.key));
+        const elsewhere = (await other.reader.getChildren(dup.key))
+          .map((raw) => toChild(raw, dup.key))
+          .filter((c): c is ChildRecord => !!c && !seen.has(c.key));
+        if (!elsewhere.length) continue;
+        unsafeToTrash.add(dup.key);
+        failed.push({
+          key: dup.key,
+          message:
+            `${other.name} lists ${elsewhere.length} child item(s) on ${dup.key} that ${other.missingFrom} ` +
+            `(${elsewhere.map((c) => c.key).join(', ')}), so ${dup.key} was left out of the ` +
+            'trash: trashing it now would take them with it once Zotero syncs. Let Zotero finish syncing ' +
+            '(zotero_sync) and merge again.',
+        });
+      } catch {
+        // The other copy is a second opinion here, not the source of truth.
+      }
+    }
+  }
+
+  // What the plan is computed from, so a caller can hand it back and approve THIS plan and
+  // not whatever a later read produces.
+  const versions = planVersions(master, duplicates, children);
+
+  const rules = await fieldRules(ctx, master.data.itemType);
+  const itemUri = itemUriFor(ctx, lib, recordUserId(rawMaster));
+  const planFor = (m: ItemRecord): { plan: MergePlan; patch: Record<string, unknown> } =>
+    buildMergePlan({
+      master: m,
+      duplicates,
+      children,
+      itemUri,
+      unsafeToTrash,
+      ...rules,
+    });
+  // Rebuilt in place if the master turns out to have moved under the merge; `structured()`
+  // and the summary both read these at return time, so the caller is shown what was written.
+  let { plan, patch } = planFor(master);
+  const filled = (): string =>
+    `${Object.keys(plan.fields).length} field(s), ${plan.tagsAdded.length} tag(s) and ${plan.collectionsAdded.length} collection(s)`;
+  const where = writer.target === 'local' ? ' in the Zotero desktop app' : '';
+
+  if (dryRun) {
+    return okLibraryContent(
+      {
+        master_key: masterKey,
+        dryRun: true,
+        plan,
+        versions,
+        readFrom: writer.target,
+        failed: failed.length ? failed : undefined,
+      },
+      `Dry run: merging ${duplicates.length} item(s) into ${masterKey}${where} would fill ${filled()}, ` +
+        `move ${plan.childrenToMove.length} child item(s), and trash ${plan.duplicatesToTrash.length} item(s). ` +
+        'Nothing was written. To run exactly this plan, pass `versions` back as `expect_versions` with dry_run:false.' +
+        (plan.fieldsSkipped.length ? ` ${plan.fieldsSkipped.length} value(s) would be left behind; see plan.fieldsSkipped.` : '') +
+        (failed.length ? ` ${failed.length} item(s) could not be planned in full; see failed.` : ''),
+    );
+  }
+
+  // The plan that was approved is the plan that runs, and this is what makes that true
+  // across two calls: the write is refused, and the fresh plan handed back as a preview,
+  // when any record the caller's preview was computed from has moved since.
+  const changed = args.expect_versions ? staleSince(args.expect_versions as ExpectedVersions, versions, masterKey) : [];
+  if (changed.length) {
+    const note =
+      'Nothing was written: the library moved since the preview that `expect_versions` describes, so that plan ' +
+      'is no longer the plan. This answer is the plan as it now stands; review it and pass its `versions` as ' +
+      '`expect_versions` to run it.';
+    return okLibraryContent(
+      {
+        master_key: masterKey,
+        dryRun: true,
+        plan,
+        versions,
+        changed,
+        readFrom: writer.target,
+        note,
+        failed: failed.length ? failed : undefined,
+      },
+      `Nothing was written: ${changed.length} record(s) changed since the preview (${changed.map(describeChange).join('; ')}). ` +
+        `Merging ${duplicates.length} item(s) into ${masterKey}${where} would NOW fill ${filled()}, ` +
+        `move ${plan.childrenToMove.length} child item(s), and trash ${plan.duplicatesToTrash.length} item(s); ` +
+        'review this plan and pass its `versions` back as `expect_versions` to run it.' +
+        (plan.fieldsSkipped.length ? ` ${plan.fieldsSkipped.length} value(s) would be left behind; see plan.fieldsSkipped.` : '') +
+        (failed.length ? ` ${failed.length} item(s) could not be planned in full; see failed.` : ''),
+    );
+  }
+
+  const attempted = 1 + children.length + duplicates.length;
+  // Gated here rather than on `duplicate_keys` alone: this call PATCHes the master and
+  // every child as well as trashing the duplicates, and a gate that counts two of those
+  // and ignores a hundred is not the gate the operator switched on.
+  const refusal = requireBulkConfirm(ctx, attempted, 'merge', args.confirm);
+  if (refusal) return refusal;
+  let replanned = false;
+  const structured = (extra: Record<string, unknown>): Record<string, unknown> => ({
+    master_key: masterKey,
+    dryRun: false,
+    plan,
+    readFrom: writer.target,
+    ...(replanned ? { replanned: true } : {}),
+    target: writer.target,
+    failed,
+    provenance: LIBRARY_CONTENT_PROVENANCE,
+    ...extra,
+  });
+
+  if (master.version == null) {
+    return err(
+      `Could not determine the current version of ${masterKey}, and a merge will not PATCH without one. Nothing was written.`,
+    );
+  }
+
+  let masterVersion: number;
+  try {
+    const written = await patchMaster(writer, masterKey, patch, master.version, planFor);
+    masterVersion = written.version;
+    if (written.replanned) {
+      replanned = true;
+      plan = written.replanned.plan;
+      patch = written.replanned.patch;
+    }
+  } catch (e) {
+    // The desktop turned out not to take writes, and this was the first one: nothing has
+    // landed, so the whole merge starts over on the cloud, reading the cloud's copy.
+    if (mustFallBack(e)) throw e;
+    failed.push({ key: masterKey, code: statusOf(e), message: `Updating the master failed: ${message(e)}` });
+    // Nothing downstream ran, so the plan must not go on claiming a trashing that will
+    // now never happen.
+    plan.duplicatesToTrash = [];
+    return writeResult(
+      structured({ applied: { childrenMoved: [], trashed: [] } }),
+      `Merging into ${masterKey} stopped at the first step: the master could not be updated, so no child item was moved and nothing was trashed.`,
+      0,
+      attempted,
+      failed,
+    );
+  }
+
+  const childrenMoved: string[] = [];
+  for (const child of children) {
+    if (child.version == null) {
+      unsafeToTrash.add(child.from);
+      failed.push({ key: child.key, message: `No version for child ${child.key}, so it was not reparented.` });
+      continue;
+    }
+    try {
+      await reparentChild(writer, child, masterKey);
+      childrenMoved.push(child.key);
+    } catch (e) {
+      const status = statusOf(e);
+      unsafeToTrash.add(child.from);
+      failed.push({
+        key: child.key,
+        code: status,
+        message:
+          `Reparenting ${child.key} onto ${masterKey} failed: ${message(e)}` +
+          (status === 400 || status === 403
+            ? ' The API refused a parentItem change on an existing child item.'
+            : '') +
+          ` ${child.from} was left out of the trash so the child is not trashed with it.`,
+      });
+    }
+  }
+
+  const trashable = duplicates.filter((d) => !unsafeToTrash.has(d.key) && d.version != null);
+  // A reparenting failure above can rule a duplicate out after the plan was built, so the
+  // plan is brought back into line with what this run has actually decided to do before it
+  // is handed back next to the failures that decided it.
+  plan.duplicatesToTrash = trashable.map((d) => d.key);
+  for (const d of duplicates) {
+    if (!unsafeToTrash.has(d.key) && d.version == null) {
+      failed.push({ key: d.key, message: `No version for ${d.key}, so it was not trashed.` });
+    }
+  }
+  const trashed: string[] = [];
+  // Recheck immediately before each trash write. The original item version does not
+  // protect against a new child: creating one need not change its parent's version (on the
+  // desktop app as on the cloud, a parent is not saved when a child arrives or leaves).
+  // The library version on the final POST closes the gap after this empty-child read: both
+  // APIs refuse the whole POST with 412 when anything in the library moved since.
+  for (const duplicate of trashable) {
+    try {
+      const remaining = await writer.getChildren(duplicate.key, { limit: 1 });
+      if (remaining.data.length || remaining.totalResults > 0) {
+        throw new Error('Child items remain or appeared during the merge; retry after reviewing them.');
+      }
+      if (!Number.isSafeInteger(remaining.lastModifiedVersion) || remaining.lastModifiedVersion <= 0) {
+        throw new Error('The child listing did not supply a library version, so an empty parent could not be safely confirmed.');
+      }
+      const result = await writer.writeItems(
+        [{ key: duplicate.key, version: duplicate.version, deleted: 1 }],
+        { libraryVersion: remaining.lastModifiedVersion },
+      );
+      trashed.push(...result.successful.map((s) => s.key), ...result.unchanged);
+      failed.push(...result.failed);
+    } catch (e) {
+      failed.push({ key: duplicate.key, code: statusOf(e), message: `Trashing ${duplicate.key} was refused: ${message(e)}` });
+    }
+  }
+  plan.duplicatesToTrash = [...trashed];
+
+  const succeeded = 1 + childrenMoved.length + trashed.length;
+  const left = duplicates.length - trashed.length;
+  return writeResult(
+    structured({ applied: { masterVersion, childrenMoved, trashed } }),
+    `Merged ${trashed.length} of ${duplicates.length} duplicate(s) into ${masterKey}${where ? ' via the Zotero desktop app' : ''}: filled ${filled()}, ` +
+      `moved ${childrenMoved.length} of ${children.length} child item(s).` +
+      (replanned
+        ? ` ${masterKey} changed ${writer.target === 'local' ? 'in the desktop app' : 'on the server'} while this merge was being planned, so the plan was rebuilt` +
+          ' against the record as it then was and `plan` describes what was written, not what a preview showed.'
+        : '') +
+      (left
+        ? ` ${left} duplicate(s) stayed in the library because something on them did not move; see failed.`
+        : ' The merged duplicates are in the Zotero trash and can be restored from there.'),
+    succeeded,
+    attempted,
+    failed,
+  );
+}
 
 export default mergeItems;

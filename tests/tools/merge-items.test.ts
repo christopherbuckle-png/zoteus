@@ -129,15 +129,12 @@ describe('zotero_merge_items dry run', () => {
     ]);
   });
 
-  it('reads through the router only when no merge could be applied at all, and says which copy it read', async () => {
-    const ctx = makeCtx({ capabilities: { cloud: null, localApi: true } });
-    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'] }, ctx);
-    expect(res.isError).toBeFalsy();
-    expect(ctx.router.getItem).toHaveBeenCalled();
+  it('previews only a merge that could run: with no copy to write to, it says so instead', async () => {
+    // A preview of a merge that cannot be applied anywhere is a plan nobody can approve. With
+    // the desktop app up the preview reads the desktop's copy (see the desktop block below).
+    const ctx = makeCtx({ capabilities: { cloud: null, localApi: false } });
+    await expect(mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'] }, ctx)).rejects.toThrow(/nowhere to go/);
     expect(ctx.web.getItem).not.toHaveBeenCalled();
-    expect(res.structuredContent.readFrom).toBe('local');
-    expect(res.structuredContent.note).toMatch(/ZOTERO_API_KEY/);
-    expect(res.structuredContent.note).toMatch(/desktop app/);
   });
 
   it('refuses when duplicate_keys names nothing but the master', async () => {
@@ -306,11 +303,11 @@ describe('zotero_merge_items apply', () => {
     expect(ctx.web.writeItems).not.toHaveBeenCalled();
   });
 
-  it('refuses to write without a cloud key, and says the preview still works', async () => {
-    const ctx = makeCtx({ capabilities: { cloud: null, localApi: true } });
-    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'], dry_run: false }, ctx);
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toMatch(/dry_run:true/);
+  it('has nowhere to write without the desktop app or a cloud key, and writes nothing', async () => {
+    const ctx = makeCtx({ capabilities: { cloud: null, localApi: false } });
+    await expect(
+      mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'], dry_run: false }, ctx),
+    ).rejects.toThrow(/Start Zotero \(version 10 or newer takes writes directly\), or set ZOTERO_API_KEY/);
     expect(ctx.web.patchItem).not.toHaveBeenCalled();
   });
 });
@@ -723,4 +720,160 @@ it.each(['note', 'attachment', 'annotation'])('refuses to merge %s content that 
     expect(ctx.web.patchItem).not.toHaveBeenCalled();
     expect(ctx.web.writeItems).not.toHaveBeenCalled();
   }
+});
+
+/**
+ * Zotero 10.0.6's local API takes a versioned PATCH (`If-Unmodified-Since-Version` against
+ * the item's own `clientVersion`) and a POST pinned to the library version, so the merge no
+ * longer needs a cloud key: it runs on the desktop app's copy, reading and writing there.
+ */
+describe('zotero_merge_items on the desktop app', () => {
+  const ME = { type: 'user' as const, id: 0 };
+  const GROUP = { type: 'group' as const, id: 6666644 };
+
+  /** The desktop's copy: the same records, at the desktop's own versions. */
+  function desktopCtx(opts: { cloud?: boolean; edit?: (items: Record<string, any>) => void } = {}): any {
+    const items: Record<string, any> = fixture();
+    items.K1.version = 2090;
+    items.D1.version = 2091;
+    items.C1.version = 2092;
+    // The desktop reports the account it syncs as on every record.
+    for (const it of Object.values(items)) it.library = { type: 'user', id: 19552201, name: 'My Library' };
+    opts.edit?.(items);
+    const children = (key: string) => Object.values(items).filter((it: any) => it.data.parentItem === key);
+    let libraryVersion = 2100;
+    const ctx = makeCtx({
+      capabilities: opts.cloud
+        ? { cloud: { userID: 19552201, username: 'oscardvs', access: {} }, localApi: true }
+        : { cloud: null, localApi: true },
+    });
+    ctx.router.defaultLibrary = () => (opts.cloud ? LIB : ME);
+    ctx.local = {
+      getItem: vi.fn(async (key: string) => items[key]),
+      getItemChildren: vi.fn(async (key: string) => ({ data: children(key), totalResults: children(key).length, lastModifiedVersion: libraryVersion })),
+    };
+    ctx.localWrites = {
+      patchItem: vi.fn(async (key: string, patch: any) => {
+        Object.assign(items[key].data, patch);
+        items[key].version = ++libraryVersion;
+        return libraryVersion;
+      }),
+      writeItems: vi.fn(async (objects: any[]) => ({
+        successful: objects.map((o, index) => ({ index, key: o.key, version: libraryVersion + 1 })),
+        unchanged: [],
+        failed: [],
+        newLibraryVersion: ++libraryVersion,
+      })),
+    };
+    return { ctx, items };
+  }
+
+  it('previews from the desktop copy with no cloud key, at the desktop versions, since that is where it would run', async () => {
+    const { ctx } = desktopCtx();
+    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'] }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(res.structuredContent.readFrom).toBe('local');
+    expect(res.structuredContent.versions).toEqual({ master: 2090, duplicates: { D1: 2091 }, children: { C1: 2092 } });
+    expect(ctx.local.getItem).toHaveBeenCalledWith('K1', {}, ME);
+    expect(ctx.web.getItem).not.toHaveBeenCalled();
+    expect(ctx.localWrites.patchItem).not.toHaveBeenCalled();
+    // No key, but the desktop names the account, so the relation is one any Zotero resolves.
+    expect(res.structuredContent.plan.relationsAdded['dc:replaces']).toEqual([URI('D1')]);
+  });
+
+  it('applies on the desktop: master PATCH, child reparent and the pinned trash POST all go there', async () => {
+    const { ctx } = desktopCtx();
+    const res: any = await mergeItems.handler(
+      { master_key: 'K1', duplicate_keys: ['D1'], dry_run: false, expect_versions: { master: 2090, duplicates: { D1: 2091 }, children: { C1: 2092 } } },
+      ctx,
+    );
+    expect(res.isError).toBeFalsy();
+    const [masterCall, childCall] = ctx.localWrites.patchItem.mock.calls;
+    expect(masterCall[0]).toBe('K1');
+    expect(masterCall[1]).toMatchObject({ DOI: '10.1/kalman', abstractNote: 'An abstract the master is missing.' });
+    expect(masterCall.slice(2)).toEqual([2090, ME]);
+    expect(childCall).toEqual(['C1', { parentItem: 'K1' }, 2092, ME]);
+    // The duplicate is trashed at the version it was read at (moving a child away does not
+    // save its parent on the desktop), and the whole POST is pinned to the library version
+    // the empty-children check was read at.
+    expect(ctx.localWrites.writeItems).toHaveBeenCalledWith([{ key: 'D1', version: 2091, deleted: 1 }], ME, { libraryVersion: 2102 });
+    expect(ctx.web.patchItem).not.toHaveBeenCalled();
+    expect(ctx.web.writeItems).not.toHaveBeenCalled();
+    expect(res.structuredContent).toMatchObject({ target: 'local', readFrom: 'local', applied: { childrenMoved: ['C1'], trashed: ['D1'] } });
+    expect(res.content[0].text).toMatch(/via the Zotero desktop app/);
+  });
+
+  it("replans against the desktop's fresh master on a desktop 412, never replaying the stale patch", async () => {
+    const { ctx, items } = desktopCtx();
+    let first = true;
+    const patch = ctx.localWrites.patchItem.getMockImplementation();
+    ctx.localWrites.patchItem = vi.fn(async (key: string, body: any, version: number, lib: any) => {
+      if (key === 'K1' && first) {
+        first = false;
+        // The user typed an abstract into the desktop app between the read and the write.
+        items.K1.data.abstractNote = 'Typed in the app just now';
+        items.K1.version = 2095;
+        throw new ZoteroApiError({ status: 412, message: 'Local API PATCH /items/K1 failed (412): item has been modified since specified version (expected 2090, found 2095)' });
+      }
+      return patch!(key, body, version, lib);
+    });
+    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'], dry_run: false }, ctx);
+    expect(res.structuredContent.replanned).toBe(true);
+    const retry = ctx.localWrites.patchItem.mock.calls[1];
+    expect(retry[2]).toBe(2095);
+    expect(retry[1].abstractNote).toBeUndefined();
+    expect(items.K1.data.abstractNote).toBe('Typed in the app just now');
+    expect(ctx.web.getItem).not.toHaveBeenCalled();
+    expect(res.content[0].text).toMatch(/changed in the desktop app/);
+  });
+
+  it('leaves the duplicate untrashed when the library moved after the empty-children check (desktop 412)', async () => {
+    const { ctx } = desktopCtx();
+    ctx.localWrites.writeItems = vi.fn(async () => {
+      throw new ZoteroApiError({ status: 412, message: 'Local API local write failed (412): Library has been modified since specified version' });
+    });
+    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'], dry_run: false }, ctx);
+    expect(res.structuredContent.applied.trashed).toEqual([]);
+    expect(res.structuredContent.plan.duplicatesToTrash).toEqual([]);
+    expect(res.structuredContent.failed.some((f: any) => f.key === 'D1' && /refused/.test(f.message))).toBe(true);
+  });
+
+  it('starts over on the cloud, from the cloud copy, when the desktop turns out not to take writes', async () => {
+    const { ctx } = desktopCtx({ cloud: true });
+    ctx.localWrites.patchItem = vi.fn(async () => {
+      throw new Error('Local API PATCH /items/K1 failed (501): Endpoint does not support method');
+    });
+    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'], dry_run: false }, ctx);
+    expect(ctx.localWrites.patchItem).toHaveBeenCalledTimes(1);
+    expect(ctx.localWrites.writeItems).not.toHaveBeenCalled();
+    // Replanned from the cloud's records, at the cloud's versions.
+    expect(ctx.web.patchItem.mock.calls[0][3]).toBe(3);
+    expect(res.structuredContent).toMatchObject({ target: 'cloud', readFrom: 'cloud', applied: { trashed: ['D1'] } });
+  });
+
+  it('keeps a duplicate out of the trash when the cloud holds a child the desktop has not synced yet', async () => {
+    const { ctx } = desktopCtx({ cloud: true });
+    ctx.web.getItemChildren = vi.fn(async (_lib: any, key: string) => ({
+      data: key === 'D1' ? [fixture().C1, { key: 'X9', version: 40, data: { key: 'X9', itemType: 'attachment', parentItem: 'D1' } }] : [],
+      totalResults: key === 'D1' ? 2 : 0,
+      lastModifiedVersion: 3476,
+    }));
+    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'], dry_run: false }, ctx);
+    expect(ctx.localWrites.writeItems).not.toHaveBeenCalled();
+    expect(res.structuredContent.applied.trashed).toEqual([]);
+    expect(res.structuredContent.failed.some((f: any) => /Zotero cloud lists 1 child item\(s\) on D1 that the desktop app does not have yet \(X9\)/.test(f.message))).toBe(true);
+  });
+
+  it('merges inside a group the desktop holds, with group URIs and group-addressed writes', async () => {
+    const { ctx } = desktopCtx();
+    ctx.capabilities.localGroupIds = [6666644];
+    const res: any = await mergeItems.handler(
+      { master_key: 'K1', duplicate_keys: ['D1'], dry_run: false, library_type: 'group', library_id: 6666644 },
+      ctx,
+    );
+    expect(ctx.local.getItem).toHaveBeenCalledWith('K1', {}, GROUP);
+    expect(ctx.localWrites.patchItem.mock.calls.map((c: any[]) => c[3])).toEqual([GROUP, GROUP]);
+    expect(ctx.localWrites.writeItems.mock.calls[0][1]).toEqual(GROUP);
+    expect(res.structuredContent.plan.relationsAdded['dc:replaces']).toEqual(['http://zotero.org/groups/6666644/items/D1']);
+  });
 });
