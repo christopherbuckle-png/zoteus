@@ -440,12 +440,19 @@ export function missingWriteAccess(
 export function requireCloud(ctx: ToolContext, lib: LibraryRef): LibraryRef {
   const cloud = ctx.capabilities.cloud;
   if (!cloud) {
+    // The personal-library message used to call every such write "a cloud/group library"
+    // and then advise the desktop app, which was wrong both ways: it was said for writes the
+    // desktop had just been skipped for, and for tools that never try the desktop at all.
+    // Which of the two it is now decides what the caller can do about it.
     throw new Error(
       lib.type === 'group'
         ? `Writing to group library ${lib.id} needs a Zotero cloud API key with write access to that group (set ZOTERO_API_KEY; create one at ${KEY_SETTINGS_URL}). ` +
           'The Zotero desktop app cannot stand in for it: its local API and the connector protocol both write your personal library only, so group writes always go through the cloud Web API, even for a group the desktop is holding.'
-        : 'This operation writes to a cloud/group library and requires a cloud API key (set ZOTERO_API_KEY). ' +
-          'For the personal library, writes can instead go through the running Zotero 10+ desktop app (local API).',
+        : ctx.capabilities.localApi
+          ? `This operation is cloud-only in Zoteus: it writes your personal library through the Zotero Web API, which needs a cloud API key (set ZOTERO_API_KEY; create one at ${KEY_SETTINGS_URL}). ` +
+            'The running Zotero desktop app cannot take this particular write.'
+          : 'This write to your personal library has nowhere to go: the Zotero desktop app is not reachable on this machine, and no cloud API key is configured. ' +
+            `Start Zotero (version 10 or newer takes writes directly), or set ZOTERO_API_KEY (create one at ${KEY_SETTINGS_URL}) with write access.`,
     );
   }
   const missing = missingWriteAccess(cloud, lib);

@@ -1,8 +1,9 @@
 import { z } from 'zod';
-import { newLibraryVersion } from './common-output.js';
+import { newLibraryVersion, writeTarget } from './common-output.js';
 import type { ToolDefinition, ToolHandlerResult } from '../registry/registry.js';
 import { libraryArgs } from './common-args.js';
-import { ok, requireCloudLibrary, resolveLibrary } from '../registry/registry.js';
+import { ok, resolveLibrary } from '../registry/registry.js';
+import { withLibraryWriter } from './library-writer.js';
 
 function err(text: string): ToolHandlerResult {
   return { content: [{ type: 'text', text }], isError: true };
@@ -12,7 +13,7 @@ const savedSearches: ToolDefinition = {
   name: 'zotero_saved_searches',
   title: 'Manage Zotero saved searches',
   description:
-    'List, create, or delete saved-search DEFINITIONS. NOTE: the Zotero cloud Web API stores saved searches but does NOT execute them — to get the items a saved search matches, run an equivalent zotero_search_items query (or use the desktop local API when available). Set `action` to "list" (all saved searches with their conditions), "create" (needs `name` and `conditions`, each `{condition, operator, value}`), or "delete" (needs `search_key`). Writes go to the cloud Web API.',
+    'List, create, or delete saved-search DEFINITIONS. NOTE: the Zotero cloud Web API stores saved searches but does NOT execute them — to get the items a saved search matches, run an equivalent zotero_search_items query (or use the desktop local API when available). Set `action` to "list" (all saved searches with their conditions), "create" (needs `name` and `conditions`, each `{condition, operator, value}`), or "delete" (needs `search_key`). Writes to your personal library go to the running Zotero desktop app (Zotero 10+) and otherwise to the cloud Web API; group libraries always write to the cloud.',
   inputSchema: {
     action: z
       .enum(['list', 'create', 'delete'])
@@ -52,6 +53,7 @@ const savedSearches: ToolDefinition = {
         .describe('Saved-search definitions (action:"list"). The cloud API stores them but does not execute them.'),
       created: z.array(z.string()).optional().describe('Key of the saved search created.'),
       deleted: z.string().optional().describe('Key of the saved search deleted.'),
+      target: writeTarget,
       libraryVersion: newLibraryVersion,
     })
     .passthrough(),
@@ -69,25 +71,26 @@ const savedSearches: ToolDefinition = {
       return ok({ searches }, `${searches.length} saved search(es). Note: the cloud API does not execute them.`);
     }
 
-    const lib = requireCloudLibrary(ctx, args);
-
-    if (args.action === 'create') {
-      if (!args.name || !args.conditions?.length) {
-        return err('`name` and at least one `conditions` entry are required for create.');
-      }
-      const result = await ctx.web.writeSearches(lib, [{ name: args.name, conditions: args.conditions }]);
-      if (result.failed.length) return err(`Create failed: ${JSON.stringify(result.failed)}`);
-      return ok(
-        { created: result.successful.map((s) => s.key), libraryVersion: result.newLibraryVersion },
-        `Created saved search "${args.name}".`,
-      );
+    if (args.action === 'create' && (!args.name || !args.conditions?.length)) {
+      return err('`name` and at least one `conditions` entry are required for create.');
     }
+    if (args.action === 'delete' && !args.search_key) return err('`search_key` is required for delete.');
 
-    // delete
-    if (!args.search_key) return err('`search_key` is required for delete.');
-    const version = await ctx.web.currentLibraryVersion(lib);
-    await ctx.web.deleteSearches(lib, [args.search_key], version);
-    return ok({ deleted: args.search_key }, `Deleted saved search ${args.search_key}.`);
+    // The desktop app for the personal library (Zotero 10's local API stores saved searches
+    // too), the cloud otherwise.
+    return withLibraryWriter(ctx, resolveLibrary(ctx, args), async (w) => {
+      const via = w.target === 'local' ? ' via the Zotero desktop app' : '';
+      if (args.action === 'create') {
+        const result = await w.writeSearches([{ name: args.name, conditions: args.conditions }]);
+        if (result.failed.length) return err(`Create failed: ${JSON.stringify(result.failed)}`);
+        return ok(
+          { created: result.successful.map((s) => s.key), target: w.target, libraryVersion: result.newLibraryVersion },
+          `Created saved search "${args.name}"${via}.`,
+        );
+      }
+      await w.deleteSearches([args.search_key!]);
+      return ok({ deleted: args.search_key, target: w.target }, `Deleted saved search ${args.search_key}${via}.`);
+    });
   },
 };
 

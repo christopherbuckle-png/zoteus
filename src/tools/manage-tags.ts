@@ -1,8 +1,9 @@
 import { z } from 'zod';
-import { writeFailures } from './common-output.js';
+import { writeFailures, writeTarget } from './common-output.js';
 import type { ToolDefinition, ToolHandlerResult } from '../registry/registry.js';
 import { libraryArgs } from './common-args.js';
-import { ok, requireCloudLibrary, resolveLibrary, requireBulkConfirm } from '../registry/registry.js';
+import { ok, resolveLibrary, requireBulkConfirm, writeResult } from '../registry/registry.js';
+import { mustFallBack, withLibraryWriter } from './library-writer.js';
 
 function err(text: string): ToolHandlerResult {
   return { content: [{ type: 'text', text }], isError: true };
@@ -12,7 +13,7 @@ const manageTags: ToolDefinition = {
   name: 'zotero_manage_tags',
   title: 'Manage Zotero tags',
   description:
-    'List tags, or add/remove tags on items. Set `action` to "list" (returns library tags; supports `q` substring filter), "add" (add `tags` to each of `item_keys`), or "remove" (remove `tags` from each of `item_keys`). Tags are stored on the parent item\'s tag array, so add/remove edits the items (cloud Web API). Tag names are case-sensitive. When the server sets a bulk-write threshold (ZOTEUS_CONFIRM_BULK_WRITES, off by default), editing more items than that in one call also needs `confirm: true`.',
+    'List tags, or add/remove tags on items. Set `action` to "list" (returns library tags; supports `q` substring filter), "add" (add `tags` to each of `item_keys`), or "remove" (remove `tags` from each of `item_keys`). Tags are stored on the parent item\'s tag array, so add/remove edits the items: in your personal library through the running Zotero desktop app (Zotero 10+) when it is up, otherwise through the cloud Web API; group libraries always write to the cloud. Tag names are case-sensitive. When the server sets a bulk-write threshold (ZOTEUS_CONFIRM_BULK_WRITES, off by default), editing more items than that in one call also needs `confirm: true`.',
   inputSchema: {
     action: z
       .enum(['list', 'add', 'remove'])
@@ -35,6 +36,7 @@ const manageTags: ToolDefinition = {
       totalResults: z.number().optional().describe('Tags matching the filter in total, not just this page.'),
       updated: z.array(z.string()).optional().describe('Item keys whose tags were changed (add/remove).'),
       failed: writeFailures,
+      target: writeTarget,
     })
     .passthrough(),
   annotations: {
@@ -68,34 +70,41 @@ const manageTags: ToolDefinition = {
       args.confirm,
     );
     if (refusal) return refusal;
-    const lib = requireCloudLibrary(ctx, args);
-    const updated: string[] = [];
-    const failed: Array<{ key: string; message: string }> = [];
-    for (const key of args.item_keys) {
-      const item = await ctx.web.getItem(lib, key);
-      const version = item?.version ?? item?.data?.version;
-      const current: Array<{ tag: string; type?: number }> = Array.isArray(item?.data?.tags)
-        ? [...item.data.tags]
-        : [];
-      let next: Array<{ tag: string; type?: number }>;
-      if (args.action === 'add') {
-        const have = new Set(current.map((t) => t.tag));
-        next = [...current, ...args.tags.filter((t: string) => !have.has(t)).map((t: string) => ({ tag: t }))];
-      } else {
-        const remove = new Set(args.tags);
-        next = current.filter((t) => !remove.has(t.tag));
+    return withLibraryWriter(ctx, resolveLibrary(ctx, args), async (w) => {
+      const updated: string[] = [];
+      const failed: Array<{ key: string; message: string }> = [];
+      for (const key of args.item_keys!) {
+        try {
+          const item = await w.getItem(key);
+          const version = item?.version ?? item?.data?.version;
+          const current: Array<{ tag: string; type?: number }> = Array.isArray(item?.data?.tags)
+            ? [...item.data.tags]
+            : [];
+          let next: Array<{ tag: string; type?: number }>;
+          if (args.action === 'add') {
+            const have = new Set(current.map((t) => t.tag));
+            next = [...current, ...args.tags!.filter((t: string) => !have.has(t)).map((t: string) => ({ tag: t }))];
+          } else {
+            const remove = new Set(args.tags);
+            next = current.filter((t) => !remove.has(t.tag));
+          }
+          await w.patchItem(key, { tags: next }, version);
+          updated.push(key);
+        } catch (e) {
+          if (mustFallBack(e)) throw e;
+          failed.push({ key, message: e instanceof Error ? e.message : String(e) });
+        }
       }
-      try {
-        await ctx.web.patchItem(lib, key, { tags: next }, version);
-        updated.push(key);
-      } catch (e) {
-        failed.push({ key, message: e instanceof Error ? e.message : String(e) });
-      }
-    }
-    return ok(
-      { updated, failed },
-      `${args.action === 'add' ? 'Added' : 'Removed'} tags on ${updated.length} item(s).`,
-    );
+      return writeResult(
+        { updated, failed, target: w.target },
+        `${args.action === 'add' ? 'Added' : 'Removed'} tags on ${updated.length} item(s)${
+          w.target === 'local' ? ' via the Zotero desktop app' : ''
+        }.`,
+        updated.length,
+        args.item_keys!.length,
+        failed,
+      );
+    });
   },
 };
 

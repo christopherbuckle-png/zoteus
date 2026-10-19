@@ -13,28 +13,34 @@ function keyFreeCtx(defaultLibrary: { type: 'user' | 'group'; id: number } = { t
       capabilities: { cloud: null, localApi: true, localGroupIds: [6666644] },
       router: { defaultLibrary: () => defaultLibrary },
       web: { setFullText },
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
     } as any,
     setFullText,
   };
 }
 
 describe('zotero_fulltext action:"set" refuses in terms of the operation, not the library', () => {
-  it('says storing full text is cloud-only, for a call that named the personal library', async () => {
-    // Measured: this answered "This operation writes to a cloud/group library and requires a
-    // cloud API key", on a personal-library call, on a machine running the desktop app. The
-    // library was not the problem: `set` is the one operation with no desktop path at all,
-    // since neither desktop write client has a full-text endpoint (#79).
+  it('goes to the desktop app for the personal library, and names its refusal when it has no endpoint', async () => {
+    // This used to be refused outright as cloud-only, on the grounds that neither desktop
+    // write path had a full-text endpoint (#79). Zotero 10's local API has one, PUT
+    // .../items/<key>/fulltext (measured on 10.0.6), so the write now goes there. A desktop
+    // without it answers 501, and with no key to fall back to, the refusal says the desktop
+    // refused, not that the library is "cloud/group".
     const { ctx, setFullText } = keyFreeCtx();
-    const res = await fulltext.handler({ action: 'set', item_key: 'CKSETW3U', content: 'text' }, ctx);
+    ctx.localWrites = {
+      setFullText: vi.fn(async () => {
+        throw new Error('Local API PUT /items/CKSETW3U/fulltext failed (501): Endpoint does not support method');
+      }),
+    };
+    const res = await fulltext.handler({ action: 'set', item_key: 'CKSETW3U', content: 'text' }, ctx).catch(
+      (e: Error) => ({ isError: true, content: [{ type: 'text' as const, text: e.message }] }),
+    );
     expect(res.isError).toBe(true);
     const msg = res.content[0]!.text;
-    expect(msg).toMatch(/cloud-only/);
-    expect(msg).toMatch(/users\/0/);
-    expect(msg).toMatch(/neither has a full-text endpoint/);
+    expect(msg).toMatch(/did not accept this write/);
     expect(msg).toMatch(/ZOTERO_API_KEY/);
-    // What still works has to be named, or the caller cannot tell reads are unaffected.
-    expect(msg).toMatch(/action:"get"/);
     expect(msg).not.toMatch(/cloud\/group/);
+    expect(ctx.localWrites.setFullText).toHaveBeenCalledWith('CKSETW3U', expect.objectContaining({ content: 'text' }));
     expect(setFullText).not.toHaveBeenCalled();
   });
 

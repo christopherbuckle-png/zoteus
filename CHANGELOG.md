@@ -4,6 +4,41 @@ All notable changes to Zoteus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Collections, saved searches, tags, `zotero_create_items`, `zotero_update_item` and
+  `zotero_fulltext action:"set"` write through the running Zotero desktop app, so they no
+  longer need a cloud key for the personal library.** On a desktop-only install (Zotero
+  10.0.6, no `ZOTERO_API_KEY`), "create a subcollection in Thesis" was refused with "This
+  operation writes to a cloud/group library and requires a cloud API key", while the same
+  install imported items and attached PDFs through the desktop without complaint. Only trash,
+  delete, annotate, attach and import had ever been routed to the desktop; every other write
+  tool demanded the cloud, although Zotero 10's local API takes all of them. Measured on
+  10.0.6: `POST /collections` (top level and nested), keyed rename, `DELETE
+  /collections?collectionKey=`, `POST`/`DELETE /searches`, item create, `PATCH` and
+  versioned keyed `POST` on `/items`, and `PUT /items/<key>/fulltext` all succeed with the
+  local grant. These tools now go to the desktop first for the personal library and to the
+  cloud otherwise, in the order the other write tools already used, and report `target`
+  (`"local"` or `"cloud"`). The versions they send are read from the same API the write goes
+  to, since the desktop numbers versions independently of the cloud. If the desktop turns out
+  not to take writes (Zotero 9, a grant that is gone) before anything was written, the whole
+  operation reruns on the cloud; once a desktop write has landed it never does, because the
+  two copies would then hold it twice after the next sync. A desktop that cannot find an item
+  is no longer mistaken for one that cannot take writes: its "Local API 404" reads matched the
+  same test as a missing write endpoint. Group libraries are unchanged and still write
+  through the cloud. The full-text change also retires the premise of #79, that neither
+  desktop write path had a full-text endpoint.
+- **A personal-library write with nowhere to go says why.** The refusal called the personal
+  library "a cloud/group library" and advised the desktop app in the same breath, including
+  when the desktop app was running. It now says one of three true things: the desktop app is
+  not reachable and there is no key; the desktop answered but refused the write (quoting
+  why); or the operation itself is cloud-only.
+- `zotero_create_items` and the `add_items`/`remove_items` and tag edits report a write that
+  failed for every item as an error rather than a success, as every other write tool already
+  did (#77). One item missing from a membership or tag edit is now a per-item failure instead
+  of aborting the call.
+
 ## [1.22.4] - 2026-10-01
 
 ### Fixed

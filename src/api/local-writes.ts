@@ -242,7 +242,7 @@ export class LocalWriteClient {
    * `version`). It is recomputed on retry so a refreshed version is actually used.
    */
   private async request(
-    method: 'POST' | 'PATCH' | 'DELETE',
+    method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
     path: string,
     init: {
       json?: unknown;
@@ -287,15 +287,50 @@ export class LocalWriteClient {
     return res;
   }
 
-  /** Multi-write (create/update) up to 50 items, mirroring the Web API semantics. */
+  /** Multi-write (create/update) of items, mirroring the Web API semantics. */
   async writeItems(items: Record<string, unknown>[]): Promise<WriteResult> {
-    // Only key-based writes (updates) need the precondition; sending it for pure
-    // creates would just invent a 412 whenever the library moved on in the meantime.
-    const hasKeyedWrite = items.some((it) => typeof it.key === 'string' && it.key);
-    const res = await this.request('POST', '/users/0/items', { json: items, libraryPrecondition: hasKeyedWrite });
-    const result = await this.parseWriteResult(res);
-    if (result.newLibraryVersion) this.libraryVersion = result.newLibraryVersion;
-    return result;
+    return this.writeObjects('items', items);
+  }
+
+  /** Create or update collections (`{name, parentCollection}`, plus `key`+`version` to update). */
+  async writeCollections(collections: Record<string, unknown>[]): Promise<WriteResult> {
+    return this.writeObjects('collections', collections);
+  }
+
+  /** Create or update saved searches (`{name, conditions}`). */
+  async writeSearches(searches: Record<string, unknown>[]): Promise<WriteResult> {
+    return this.writeObjects('searches', searches);
+  }
+
+  /**
+   * POST objects of one kind, in batches of 50 (the local API answers a larger batch with
+   * 413), with the per-batch results merged back onto the caller's indexes.
+   *
+   * A key-based write needs a concurrency precondition, and Zotero takes either a
+   * per-object `version` or the library-wide `If-Unmodified-Since-Version`. The library one
+   * is sent only when some keyed object carries no version of its own: alongside versioned
+   * objects it adds nothing but a 412 whenever anything else in the library moved since the
+   * last probe, and for pure creates it would invent the same 412 for nothing.
+   */
+  private async writeObjects(
+    kind: 'items' | 'collections' | 'searches',
+    objects: Record<string, unknown>[],
+  ): Promise<WriteResult> {
+    const merged: WriteResult = { successful: [], unchanged: [], failed: [], newLibraryVersion: 0 };
+    for (let offset = 0; offset < objects.length; offset += MAX_WRITE_OBJECTS) {
+      const batch = objects.slice(offset, offset + MAX_WRITE_OBJECTS);
+      const needsPrecondition = batch.some(
+        (o) => typeof o.key === 'string' && o.key && (o.version === undefined || o.version === null),
+      );
+      const res = await this.request('POST', `/users/0/${kind}`, { json: batch, libraryPrecondition: needsPrecondition });
+      const result = await this.parseWriteResult(res);
+      if (result.newLibraryVersion) this.libraryVersion = result.newLibraryVersion;
+      merged.successful.push(...result.successful.map((s) => ({ ...s, index: s.index + offset })));
+      merged.failed.push(...result.failed.map((f) => ({ ...f, index: f.index + offset })));
+      merged.unchanged.push(...result.unchanged.map((i) => String(Number(i) + offset)));
+      merged.newLibraryVersion = result.newLibraryVersion || merged.newLibraryVersion;
+    }
+    return merged;
   }
 
   /**
@@ -319,9 +354,20 @@ export class LocalWriteClient {
     return merged;
   }
 
-  /** Partial single-item update. */
-  async patchItem(key: string, patch: Record<string, unknown>): Promise<number> {
-    const res = await this.request('PATCH', `/users/0/items/${key}`, { json: patch, libraryPrecondition: true });
+  /**
+   * Partial single-item update. With `version` (the item's own, as a read of it reported),
+   * that is the precondition, exactly as on the Web API: Zotero answers 412 only when THIS
+   * item changed since, which is the conflict a caller can resolve by re-reading it.
+   * Without one, the library version last seen stands in.
+   */
+  async patchItem(key: string, patch: Record<string, unknown>, version?: number): Promise<number> {
+    const res = await this.request(
+      'PATCH',
+      `/users/0/items/${key}`,
+      version === undefined
+        ? { json: patch, libraryPrecondition: true }
+        : { json: patch, headers: { 'If-Unmodified-Since-Version': String(version) } },
+    );
     if (!res.ok) await this.throwApi(res, `PATCH /items/${key}`);
     const v = Number(res.headers.get('last-modified-version'));
     await res.body?.cancel().catch(() => {});
@@ -335,14 +381,63 @@ export class LocalWriteClient {
    * precondition. Use {@link setDeleted} for the reversible trash.
    */
   async deleteItems(keys: string[]): Promise<void> {
+    await this.deleteByKeys('items', 'itemKey', keys);
+  }
+
+  /**
+   * Erase collections by key. As on the Web API, the items in them are not touched: they
+   * lose that membership and stay in the library. Subcollections go with their parent.
+   */
+  async deleteCollections(keys: string[]): Promise<void> {
+    await this.deleteByKeys('collections', 'collectionKey', keys);
+  }
+
+  /** Erase saved-search definitions by key (the items they matched are not touched). */
+  async deleteSearches(keys: string[]): Promise<void> {
+    await this.deleteByKeys('searches', 'searchKey', keys);
+  }
+
+  private async deleteByKeys(kind: 'items' | 'collections' | 'searches', param: string, keys: string[]): Promise<void> {
     for (const chunk of chunks(keys)) {
-      const path = `/users/0/items?itemKey=${chunk.join(',')}`;
+      const path = `/users/0/${kind}?${param}=${chunk.join(',')}`;
       const res = await this.request('DELETE', path, { libraryPrecondition: true });
       if (!res.ok && res.status !== 204) await this.throwApi(res, `DELETE ${path}`);
       const v = Number(res.headers.get('last-modified-version'));
       await res.body?.cancel().catch(() => {});
       if (Number.isFinite(v)) this.libraryVersion = v;
     }
+  }
+
+  /**
+   * Store full text for one attachment, the local twin of the Web API's
+   * `PUT /items/<key>/fulltext`. Zotero files it as the attachment's own index content, so
+   * the desktop's full-text search and `GET …/fulltext` see it at once. A Zotero 10 build
+   * without the endpoint answers 501, which callers read as "no local writes" and route to
+   * the cloud instead.
+   */
+  async setFullText(
+    key: string,
+    body: { content: string; indexedChars?: number; totalChars?: number; indexedPages?: number; totalPages?: number },
+  ): Promise<void> {
+    const res = await this.request('PUT', `/users/0/items/${key}/fulltext`, { json: body });
+    if (res.status === 404) {
+      const text = await res.text().catch(() => '');
+      // A build without the endpoint says "No endpoint found", which must stay a "Local API"
+      // failure so callers fall back. Plain "Not found" is the item, and says so without the
+      // words that would send a missing attachment off to the cloud to fail again there.
+      if (!/no endpoint/i.test(text)) {
+        throw new ZoteroApiError({
+          status: 404,
+          message: `No stored file attachment ${key} in the desktop library, so there is nothing to attach full text to. Full text belongs to an attachment (a PDF, EPUB or snapshot), not to its parent item.`,
+          body: text,
+        });
+      }
+      throw new ZoteroApiError({ status: 404, message: `Local API PUT /items/${key}/fulltext failed (404): ${text.slice(0, 400)}`, body: text });
+    }
+    if (!res.ok && res.status !== 204) await this.throwApi(res, `PUT /items/${key}/fulltext`);
+    const v = Number(res.headers.get('last-modified-version'));
+    await res.body?.cancel().catch(() => {});
+    if (Number.isFinite(v)) this.libraryVersion = v;
   }
 
   /**

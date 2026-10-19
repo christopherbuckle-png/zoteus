@@ -1,13 +1,9 @@
 import { z } from 'zod';
 import type { ToolDefinition, ToolHandlerResult } from '../registry/registry.js';
 import { libraryArgs } from './common-args.js';
-import {
-  ok,
-  isPersonalLibrary,
-  optionalLibrary,
-  requireCloudLibrary,
-  resolveLibrary,
-} from '../registry/registry.js';
+import { ok, optionalLibrary, resolveLibrary } from '../registry/registry.js';
+import { writeTarget } from './common-output.js';
+import { withLibraryWriter } from './library-writer.js';
 
 function err(text: string): ToolHandlerResult {
   return { content: [{ type: 'text', text }], isError: true };
@@ -17,12 +13,12 @@ const fulltext: ToolDefinition = {
   name: 'zotero_fulltext',
   title: 'Attachment full-text',
   description:
-    "Not a search — to find which items contain a term, use `zotero_search_items` with qmode=everything. This reads, sets, or tracks one attachment's already-extracted full text by key. `action`: \"get\" returns the indexed text content plus indexing stats for an attachment item (only attachment items have full text; returns found:false if none); \"set\" stores extracted text for an attachment (provide `content` and the indexing counts); \"since\" returns the map of attachment keys whose full text changed after a given library `version` (useful for incremental indexing). Only attachment items support full text. \"get\" and \"since\" read through the running Zotero desktop app when there is one (no cloud key needed), otherwise the cloud Web API; \"set\" always writes via the cloud Web API, which has no desktop equivalent, so it needs ZOTERO_API_KEY even for the personal library.",
+    "Not a search — to find which items contain a term, use `zotero_search_items` with qmode=everything. This reads, sets, or tracks one attachment's already-extracted full text by key. `action`: \"get\" returns the indexed text content plus indexing stats for an attachment item (only attachment items have full text; returns found:false if none); \"set\" stores extracted text for an attachment (provide `content` and the indexing counts); \"since\" returns the map of attachment keys whose full text changed after a given library `version` (useful for incremental indexing). Only attachment items support full text. All three go through the running Zotero desktop app when there is one (no cloud key needed; \"set\" needs Zotero 10+ and writes your personal library only), otherwise the cloud Web API.",
   inputSchema: {
     action: z
       .enum(['get', 'set', 'since'])
       .describe(
-        'What to do. "get" reads one attachment\'s indexed text (needs `item_key`); "set" stores extracted text for it (needs `item_key` + `content`, cloud only); "since" lists attachment keys whose text changed after `since`.',
+        'What to do. "get" reads one attachment\'s indexed text (needs `item_key`); "set" stores extracted text for it (needs `item_key` + `content`); "since" lists attachment keys whose text changed after `since`.',
       ),
     item_key: z.string().optional().describe('Attachment item key (get/set).'),
     since: z.number().int().optional().describe('Library version for "since" (default 0).'),
@@ -48,6 +44,7 @@ const fulltext: ToolDefinition = {
         .describe('action:"since": attachment key to the full-text version it changed at.'),
       count: z.number().optional().describe('How many attachments that map holds.'),
       length: z.number().optional().describe('Characters stored (action:"set").'),
+      target: writeTarget,
     })
     .passthrough(),
   annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
@@ -70,33 +67,24 @@ const fulltext: ToolDefinition = {
 
     // set
     if (!args.item_key || args.content == null) return err('`item_key` and `content` are required for set.');
-    const target = resolveLibrary(ctx, args);
-    // A personal-library `set` with no key is not a cloud/group request, which is what
-    // requireCloud() would have called it. It is a request for the one operation this
-    // server implements over the Web API only: `ctx.web.setFullText` is the sole writer of
-    // full text here, and neither desktop write client (the Zotero 10+ local API, the
-    // connector protocol) has a full-text endpoint to route it to. Saying "cloud/group"
-    // pointed at the library; the reason is the operation.
-    if (!ctx.capabilities.cloud && isPersonalLibrary(target)) {
-      return err(
-        `Storing full text is cloud-only in Zoteus: action:"set" is a PUT to the Zotero Web API, and no cloud API key ` +
-          `is configured (ZOTERO_API_KEY is unset). This call named the personal library (users/${target.id}), not a ` +
-          `group, but a running Zotero desktop app cannot take this write the way it takes item writes: its local API ` +
-          `and the connector protocol create and edit items and files, and neither has a full-text endpoint. ` +
-          `Set ZOTERO_API_KEY (https://www.zotero.org/settings/keys) to write the cloud copy. Nothing else is blocked: ` +
-          `the desktop app maintains its own full-text index, action:"get" returns what it has already extracted for ` +
-          `an attachment, and action:"since" lists what changed.`,
-      );
-    }
-    const lib = requireCloudLibrary(ctx, args);
-    await ctx.web.setFullText(lib, args.item_key, {
+    // The desktop app for the personal library, the cloud otherwise. This was cloud-only on
+    // the grounds that neither desktop write path had a full-text endpoint, which stopped
+    // being true when Zotero 10's local API gained `PUT …/items/<key>/fulltext`. A desktop
+    // without it answers 501 and the write goes to the cloud as before.
+    const body = {
       content: args.content,
       indexedChars: args.indexed_chars,
       totalChars: args.total_chars,
       indexedPages: args.indexed_pages,
       totalPages: args.total_pages,
+    };
+    return withLibraryWriter(ctx, resolveLibrary(ctx, args), async (w) => {
+      await w.setFullText(args.item_key!, body);
+      return ok(
+        { item_key: args.item_key, length: args.content!.length, target: w.target },
+        `Set full text for ${args.item_key}${w.target === 'local' ? ' via the Zotero desktop app' : ''}.`,
+      );
     });
-    return ok({ item_key: args.item_key, length: args.content.length }, `Set full text for ${args.item_key}.`);
   },
 };
 

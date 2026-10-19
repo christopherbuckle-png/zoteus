@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LocalWriteClient } from '../../src/api/local-writes.js';
 import { RateLimitedFetcher, type FetchLike } from '../../src/api/http.js';
+import { isLocalWritesUnavailable } from '../../src/registry/registry.js';
 
 const SERVER_ID = 'zotero-instance-1';
 
@@ -284,6 +285,115 @@ describe('LocalWriteClient (Zotero 10+ desktop writes)', () => {
     const client = makeClient(fetchImpl, { key: 'k' });
     await client.uploadFile('ATT1', { bytes: new Uint8Array([1]), filename: 'a.pdf', contentType: 'application/pdf' });
     expect(posts).toEqual([expect.stringMatching(/\/items\/ATT1\/file$/)]);
+  });
+
+  // Collections, saved searches and full text: the writes Zotero 10's local API takes that
+  // Zoteus used to send to the cloud only (measured against Zotero 10.0.6).
+  it('creates collections at /collections with no precondition, and renames by key and version without the library one', async () => {
+    const posts: Array<{ url: string; headers: Record<string, string>; body: unknown }> = [];
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return probeResponse();
+      posts.push({ url, headers: (init?.headers ?? {}) as Record<string, string>, body: JSON.parse(String(init.body)) });
+      return okJson({ successful: { '0': { key: 'SUBCOL01', version: 18 } }, failed: {}, unchanged: {} }, { 'last-modified-version': '18' });
+    });
+    const client = makeClient(fetchImpl, { key: 'k' });
+    const created = await client.writeCollections([{ name: 'Draft', parentCollection: 'THESIS01' }]);
+    expect(created.successful).toEqual([{ index: 0, key: 'SUBCOL01', version: 18 }]);
+    expect(posts[0]!.url).toBe('http://127.0.0.1:23119/api/users/0/collections');
+    expect(posts[0]!.headers['If-Unmodified-Since-Version']).toBeUndefined();
+    // A per-object version is the precondition; the library one would add only a 412
+    // whenever anything else in the library moved since the last probe.
+    await client.writeCollections([{ key: 'SUBCOL01', version: 18, name: 'Final' }]);
+    expect(posts[1]!.headers['If-Unmodified-Since-Version']).toBeUndefined();
+    // A keyed write without a version still needs one, and gets the library's.
+    await client.writeCollections([{ key: 'SUBCOL01', name: 'Final' }]);
+    expect(posts[2]!.headers['If-Unmodified-Since-Version']).toBe('18');
+  });
+
+  it('writes saved searches at /searches', async () => {
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return probeResponse();
+      urls.push(url);
+      return okJson({ successful: { '0': { key: 'SRCH0001', version: 18 } }, failed: {}, unchanged: {} });
+    });
+    const client = makeClient(fetchImpl, { key: 'k' });
+    await client.writeSearches([{ name: 's', conditions: [{ condition: 'tag', operator: 'is', value: 'x' }] }]);
+    expect(urls).toEqual(['http://127.0.0.1:23119/api/users/0/searches']);
+  });
+
+  it('splits a write of more than 50 objects into batches and keeps the caller\'s indexes', async () => {
+    // The local API answers a batch of 51 with 413; create_items promises auto-chunking.
+    const sizes: number[] = [];
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return probeResponse();
+      const batch = JSON.parse(String(init.body)) as unknown[];
+      sizes.push(batch.length);
+      const failed = sizes.length === 2 ? { '3': { code: 400, message: 'bad' } } : {};
+      return okJson({ successful: { '0': { key: `K${sizes.length}`, version: 1 } }, failed, unchanged: { '1': 'U' } });
+    });
+    const client = makeClient(fetchImpl, { key: 'k' });
+    const result = await client.writeItems(Array.from({ length: 120 }, () => ({ itemType: 'book' })));
+    expect(sizes).toEqual([50, 50, 20]);
+    expect(result.successful.map((s) => s.index)).toEqual([0, 50, 100]);
+    expect(result.failed).toEqual([expect.objectContaining({ index: 53, message: 'bad' })]);
+    expect(result.unchanged).toEqual(['1', '51', '101']);
+  });
+
+  it('deletes collections and saved searches by key with the library precondition', async () => {
+    const dels: Array<{ url: string; headers: Record<string, string> }> = [];
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return probeResponse();
+      dels.push({ url, headers: (init?.headers ?? {}) as Record<string, string> });
+      return new Response(null, { status: 204, headers: { 'last-modified-version': '19' } });
+    });
+    const client = makeClient(fetchImpl, { key: 'k' });
+    await client.deleteCollections(['C1', 'C2']);
+    await client.deleteSearches(['S1']);
+    expect(dels[0]!.url).toBe('http://127.0.0.1:23119/api/users/0/collections?collectionKey=C1,C2');
+    expect(dels[0]!.headers['If-Unmodified-Since-Version']).toBe('17');
+    expect(dels[1]!.url).toBe('http://127.0.0.1:23119/api/users/0/searches?searchKey=S1');
+  });
+
+  it("patches at the item's own version when one is given, and at the library's otherwise", async () => {
+    const seen: Array<Record<string, string>> = [];
+    const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return probeResponse();
+      seen.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response(null, { status: 204, headers: { 'last-modified-version': '20' } });
+    });
+    const client = makeClient(fetchImpl, { key: 'k' });
+    expect(await client.patchItem('K1', { title: 'x' }, 12)).toBe(20);
+    expect(seen[0]!['If-Unmodified-Since-Version']).toBe('12');
+    await client.patchItem('K1', { title: 'y' });
+    expect(seen[1]!['If-Unmodified-Since-Version']).toBe('20');
+  });
+
+  it('stores full text with a PUT, and tells a missing attachment from a missing endpoint', async () => {
+    let answer: Response = new Response(null, { status: 204, headers: { 'last-modified-version': '21' } });
+    const puts: Array<{ url: string; body: unknown }> = [];
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return probeResponse();
+      puts.push({ url, body: JSON.parse(String(init.body)) });
+      return answer;
+    });
+    const client = makeClient(fetchImpl, { key: 'k' });
+    await client.setFullText('PDF00001', { content: 'text', indexedPages: 2, totalPages: 3 });
+    expect(puts[0]).toEqual({
+      url: 'http://127.0.0.1:23119/api/users/0/items/PDF00001/fulltext',
+      body: { content: 'text', indexedPages: 2, totalPages: 3 },
+    });
+
+    // "Not found" is the item: it must not read as a missing write endpoint, or the write is
+    // sent to the cloud to fail again there.
+    answer = new Response('Not found', { status: 404 });
+    const missing = await client.setFullText('PARENT01', { content: 'x' }).catch((e: Error) => e);
+    expect((missing as Error).message).toMatch(/No stored file attachment PARENT01/);
+    expect(isLocalWritesUnavailable(missing)).toBe(false);
+
+    answer = new Response('No endpoint found', { status: 404 });
+    const noEndpoint = await client.setFullText('PDF00001', { content: 'x' }).catch((e: Error) => e);
+    expect(isLocalWritesUnavailable(noEndpoint)).toBe(true);
   });
 
   it('reports a read-only local API (Zotero 9 and earlier) as "not supported"', async () => {
