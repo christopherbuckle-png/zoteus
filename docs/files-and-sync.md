@@ -7,7 +7,7 @@ Lists the group libraries your key can access (id, name, type, item count, edit 
 
 With no key at all it lists the groups a running Zotero 10+ desktop app holds, since those are exactly the ones you can still read. The desktop serves a group's `id`, `name` and `description` plus its own item count, which counts child attachments, notes and trashed items; it does not store `type` or `libraryEditing`, so those are absent from such rows rather than guessed. Where a key and a desktop app are both present the two lists merge into one row per group, each marked `source: "cloud"`, `"local"` or `"both"`.
 
-Reading a group needs the key to have *read* access to it (or a Zotero 10+ desktop app that holds the group, which serves reads with no key at all). **Writing** to one always goes to the cloud Web API and needs a key with write access to that group, whatever the desktop app is doing: see [Group libraries](./writing.md#group-libraries).
+Reading a group needs the key to have *read* access to it (or a Zotero 10+ desktop app that holds the group, which serves reads with no key at all). **Writing** to one goes through a Zotero 10+ desktop app that holds the group, with no key, and otherwise through the cloud Web API with a key that has write access to that group: see [Group libraries](./writing.md#group-libraries).
 
 ## `zotero_export`
 Exports items in a machine-readable bibliographic format and returns the raw text:
@@ -19,7 +19,7 @@ Read or write attachment full text (only attachment items have it):
 - `set` — store extracted text (`content` + char/page counts).
 - `since` — map of attachment keys whose full text changed after a library version (for incremental indexing).
 
-> `get` and `since` are **routed** like every other read: Zotero 7+ serves the same `/fulltext` endpoints from the desktop app, so they need no cloud key when it is running. Group libraries, and everything when the app is closed, go to the cloud Web API. `set` is a write and always goes to the cloud.
+> `get` and `since` are **routed** like every other read: Zotero 7+ serves the same `/fulltext` endpoints from the desktop app, so they need no cloud key when it is running. Group libraries the app does not hold, and everything when the app is closed, go to the cloud Web API. `set` is a write: it goes to the desktop app (Zotero 10+) for any library the app holds, and to the cloud otherwise.
 
 ## `zotero_sync`
 The version-based delta the Zotero sync algorithm uses. Given `since` (a library version, 0 = everything), returns per-type maps of changed keys (items/collections/searches/tags) plus the deletion log. Fetch only the changed keys afterward — don't re-pull the whole library.

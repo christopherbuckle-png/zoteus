@@ -26,9 +26,59 @@ All notable changes to Zoteus are documented here. The format is based on
   operation reruns on the cloud; once a desktop write has landed it never does, because the
   two copies would then hold it twice after the next sync. A desktop that cannot find an item
   is no longer mistaken for one that cannot take writes: its "Local API 404" reads matched the
-  same test as a missing write endpoint. Group libraries are unchanged and still write
-  through the cloud. The full-text change also retires the premise of #79, that neither
-  desktop write path had a full-text endpoint.
+  same test as a missing write endpoint. Group libraries the app holds follow in the next
+  entry. The full-text change also retires the premise of #79, that neither desktop write
+  path had a full-text endpoint.
+- **Group libraries the desktop app holds are written through it, with no cloud key.** Every
+  write client addressed `/api/users/0`, and the docs said group writes always go to the
+  cloud, so a keyless install could read a group it held and write nothing to it. Zotero
+  10.0.6 takes writes on `/api/groups/<id>/...` exactly as on the personal library (checked
+  in its `server_localAPI.js`, and measured: a collection, items, a tag edit, a PATCH, a
+  merge, an attachment upload and download, full text, trash and a collection delete all
+  landed in a synced group, key-free). Every write tool now goes to the desktop for a group
+  in the app's own group list and to the cloud otherwise; `LocalWriteClient` takes the
+  library on every method and tracks each library's version separately, since a group's
+  numbering has nothing to do with the personal library's. A group the app holds read-only
+  is refused by name, saying the group's Library Editing (or File Editing) setting leaves
+  this account out, instead of Zotero's bare "Write access denied", and is not retried on
+  the cloud, which refuses the same account for the same reason. With no key and no desktop
+  holding the group, the refusal now says which of the two is missing rather than claiming
+  the desktop can only ever write the personal library. The connector protocol, which saves
+  into whatever library the app has open, stays personal-only.
+- **A library with an unsynced cloud write keeps its writes on the cloud until the desktop
+  catches up.** Reads of such a library were already held on the cloud until the desktop
+  app was seen to hold that write; writes now follow the same rule. Otherwise a write sent
+  to the desktop in that interval was invisible to the reads that came next, and acted on a
+  copy missing the change the cloud took (an update to an item the desktop had never seen was
+  a 404 there). This only arises when a write had to go to the cloud, for instance because
+  the app was not running; desktop writes record nothing, since reads of that library
+  already go to the app.
+- **`zotero_merge_items` applies merges through the desktop app.** It refused to write
+  without a key, claiming only the cloud takes a versioned PATCH, which has not been true
+  since Zotero 10: the local API checks `If-Unmodified-Since-Version` against each item's own
+  `clientVersion` and pins a POST to the library's. A merge now runs on the desktop for any
+  library it holds and on the cloud otherwise, reading and writing one copy: the preview,
+  the plan's `versions`, the master's PATCH, the 412 replan of the master, the child
+  reparenting and the final trash POST pinned to the library version all come from the same
+  API, reported as `readFrom` and `target`. The second-opinion veto now runs both ways: on
+  the desktop, a child the cloud has and the desktop has not yet pulled keeps its duplicate
+  out of the trash, as a child only the desktop had already did for a cloud merge. If the
+  desktop turns out not to take writes (Zotero 9), the merge reruns on the cloud from the
+  cloud's records before anything was written. Without a key, the `dc:replaces` relation now
+  names the account the desktop syncs as rather than `users/0`, which no Zotero resolves.
+- **`zotero_attachment` uploads and downloads through the desktop app.** Both went through
+  the cloud only. An upload (from `url` or `file_path`, standalone or under `parent_item`) now
+  goes through the desktop's own three-phase upload for any library it holds, with the same
+  fallback rule as `zotero_attach_file`: to the cloud only if nothing was created yet. A
+  download reads the file the desktop holds on its own disk, routed like every other read,
+  and falls back to Zotero file storage when the desktop cannot produce it (a file never
+  downloaded to this computer), saying why. Results carry `target` (upload) and `readFrom`
+  (download).
+- **A desktop answering 400 is no longer taken for a desktop that cannot write.** Full text
+  for a `text/plain` attachment is refused by Zotero 10.0.6 with "Full-text content is not
+  supported for this item type", and the words "not supported" made Zoteus read that as a
+  missing write path: a keyless caller got a refusal about Zotero versions and grants, and a
+  keyed one would have been sent to the cloud. Any 400 now surfaces as Zotero's own reason.
 - **A personal-library write with nowhere to go says why.** The refusal called the personal
   library "a cloud/group library" and advised the desktop app in the same breath, including
   when the desktop app was running. It now says one of three true things: the desktop app is
