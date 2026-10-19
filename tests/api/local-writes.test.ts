@@ -412,6 +412,15 @@ describe('LocalWriteClient (Zotero 10+ desktop writes)', () => {
     expect(isLocalWritesUnavailable(new Error('Local API local write failed (501): Endpoint does not support method'))).toBe(true);
   });
 
+  it('says up front whether the running app takes writes, from the probe alone', async () => {
+    const zotero10 = makeClient(vi.fn(async () => probeResponse()), { key: 'k' });
+    expect(await zotero10.acceptsWrites()).toBe(true);
+    const zotero9 = makeClient(vi.fn(async () => new Response(JSON.stringify([]), { status: 200 })), { key: 'k' });
+    expect(await zotero9.acceptsWrites()).toBe(false);
+    const down = makeClient(vi.fn(async () => { throw new TypeError('fetch failed'); }), { key: 'k' });
+    expect(await down.acceptsWrites()).toBe(false);
+  });
+
   it('reports a read-only local API (Zotero 9 and earlier) as "not supported"', async () => {
     // 9.x answers reads fine but never sends Zotero-Server-ID, since writes do not exist.
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify([]), { status: 200 }));

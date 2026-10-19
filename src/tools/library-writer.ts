@@ -121,6 +121,33 @@ function localWriter(ctx: ToolContext, lib: LibraryRef, client: LocalWriteClient
 }
 
 /**
+ * A writer that only reads, for a preview this server could not apply: no desktop taking the
+ * library's writes and no cloud key allowed to. Its reads are routed like any other read
+ * (the desktop when it serves the library, the cloud otherwise), and `target` says which, so
+ * the preview still names the copy it describes. Every write refuses, so a caller that
+ * forgot it was previewing cannot reach either API through it.
+ */
+export function previewWriter(ctx: ToolContext, lib: LibraryRef): LibraryWriter {
+  const refuse = async (): Promise<never> => {
+    throw new Error('This writer only previews: nothing here can take a write to this library.');
+  };
+  return {
+    target: ctx.router.servesLocally(lib) ? 'local' : 'cloud',
+    lib,
+    getItem: (key) => ctx.router.getItem(key, { library: lib }),
+    getChildren: (key, page) => ctx.router.getItemChildren(key, { library: lib, ...page }),
+    getCollection: (key) => ctx.router.getCollection(key, { library: lib }),
+    writeItems: refuse,
+    writeCollections: refuse,
+    writeSearches: refuse,
+    patchItem: refuse,
+    deleteCollections: refuse,
+    deleteSearches: refuse,
+    setFullText: refuse,
+  };
+}
+
+/**
  * Run a write operation against `lib` on the running desktop app when it can take it, and
  * on the cloud Web API otherwise. The order every desktop-capable write tool already used
  * (`zotero_trash_items`, `zotero_delete_items`, `zotero_annotate`), shared so the rest stop

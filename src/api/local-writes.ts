@@ -162,6 +162,20 @@ export class LocalWriteClient {
     if (Number.isFinite(version) && version > 0) this.libraryVersions.set(localLibraryPrefix(lib), version);
   }
 
+  /**
+   * Whether the running app takes local-API writes at all. The probe every write starts with
+   * answers it (a Zotero 9 sends no `Zotero-Server-ID`), and it is cached once it succeeds,
+   * so asking costs one GET per Zoteus process on a Zotero 10, and one per write on a 9.
+   */
+  async acceptsWrites(): Promise<boolean> {
+    try {
+      await this.getServerId();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Stable ID of the running Zotero instance (required on every write). */
   async getServerId(): Promise<string> {
     return (await this.probe()).serverId;

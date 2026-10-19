@@ -2,8 +2,10 @@ import { z } from 'zod';
 import type { ToolContext, ToolDefinition, ToolHandlerResult } from '../registry/registry.js';
 import {
   LIBRARY_CONTENT_PROVENANCE,
+  desktopTakesWrites,
   okLibraryContent,
   requireBulkConfirm,
+  requireCloud,
   resolveLibrary,
   writeResult,
 } from '../registry/registry.js';
@@ -11,7 +13,7 @@ import { libraryArgs } from './common-args.js';
 import { provenance, writeFailures, writeTarget } from './common-output.js';
 import { ZoteroApiError } from '../api/errors.js';
 import type { LibraryRef, ListResult } from '../api/web-client.js';
-import { mustFallBack, withLibraryWriter, type LibraryWriter } from './library-writer.js';
+import { mustFallBack, previewWriter, withLibraryWriter, type LibraryWriter } from './library-writer.js';
 import {
   buildMergePlan,
   type ChildRecord,
@@ -137,6 +139,16 @@ function writerReader(writer: LibraryWriter): Reader {
   };
 }
 
+/** Why the cloud would refuse this merge's writes to `lib`, or undefined when it would take them. */
+function cloudWriteRefusal(ctx: ToolContext, lib: LibraryRef): string | undefined {
+  try {
+    requireCloud(ctx, lib);
+    return undefined;
+  } catch (e) {
+    return message(e);
+  }
+}
+
 /**
  * The OTHER copy, asked only for a second opinion on which children hang off a duplicate:
  * the desktop app's when the merge writes to the cloud, the cloud's when it writes to the
@@ -146,13 +158,23 @@ function otherCopy(ctx: ToolContext, writer: LibraryWriter): { reader: Reader; n
   const lib = writer.lib;
   if (writer.target === 'cloud') {
     if (!ctx.router.servesLocally(lib)) return null;
+    const local = ctx.local;
+    // The desktop itself, not `ctx.router`: while a cloud write to this library waits for the
+    // app to sync, the router answers its reads from the cloud, and that is now the usual
+    // reason a merge lands on the cloud with the app up, so the "second opinion" would have
+    // been the cloud agreeing with itself and a child added in the app would be missed.
     return {
       name: 'The Zotero desktop app',
       missingFrom: 'the cloud copy does not have yet',
-      reader: {
-        getItem: (key) => ctx.router.getItem(key, { library: lib }),
-        getChildren: (key) => allChildren((start, limit) => ctx.router.getItemChildren(key, { library: lib, start, limit })),
-      },
+      reader: local
+        ? {
+            getItem: (key) => local.getItem(key, {}, lib),
+            getChildren: (key) => allChildren((start, limit) => local.getItemChildren(key, { start, limit }, lib)),
+          }
+        : {
+            getItem: (key) => ctx.router.getItem(key, { library: lib }),
+            getChildren: (key) => allChildren((start, limit) => ctx.router.getItemChildren(key, { library: lib, start, limit })),
+          },
     };
   }
   if (!ctx.capabilities.cloud) return null;
@@ -464,9 +486,21 @@ const mergeItems: ToolDefinition = {
       );
     }
 
-    return withLibraryWriter(ctx, resolveLibrary(ctx, args), (writer) =>
-      runMerge(ctx, args, writer, masterKey, duplicateKeys, dryRun),
-    );
+    const lib = resolveLibrary(ctx, args);
+    // A preview writes nothing, so it must not need what only a write needs. Without this, a
+    // dry run with the desktop not taking this library's writes (app down, group not held,
+    // sync pending) went through the cloud write gate and was refused for a key that is
+    // read-only, or absent, although reading is all a preview does.
+    // Only when some copy can be read at all: with no key and no desktop serving the library
+    // there is nothing to preview, and the write gate's "nowhere to go" is the answer.
+    if (dryRun && !(await desktopTakesWrites(ctx, lib))) {
+      const cannotApply = cloudWriteRefusal(ctx, lib);
+      const readable = Boolean(ctx.capabilities.cloud) || ctx.router.servesLocally(lib);
+      if (cannotApply && readable) {
+        return runMerge(ctx, args, previewWriter(ctx, lib), masterKey, duplicateKeys, true, cannotApply);
+      }
+    }
+    return withLibraryWriter(ctx, lib, (writer) => runMerge(ctx, args, writer, masterKey, duplicateKeys, dryRun));
   },
 };
 
@@ -487,6 +521,8 @@ async function runMerge(
   masterKey: string,
   duplicateKeys: string[],
   dryRun: boolean,
+  /** Set for a preview no API here could apply: why, so the answer can say so. */
+  cannotApply?: string,
 ): Promise<ToolHandlerResult> {
   const lib = writer.lib;
   const read = writerReader(writer);
@@ -600,8 +636,10 @@ async function runMerge(
         plan,
         versions,
         readFrom: writer.target,
+        note: cannotApply ? `Preview only: this server cannot apply this merge. ${cannotApply}` : undefined,
         failed: failed.length ? failed : undefined,
       },
+      (cannotApply ? 'Preview only, this server cannot apply it (see note). ' : '') +
       `Dry run: merging ${duplicates.length} item(s) into ${masterKey}${where} would fill ${filled()}, ` +
         `move ${plan.childrenToMove.length} child item(s), and trash ${plan.duplicatesToTrash.length} item(s). ` +
         'Nothing was written. To run exactly this plan, pass `versions` back as `expect_versions` with dry_run:false.' +

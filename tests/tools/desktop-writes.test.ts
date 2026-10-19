@@ -154,6 +154,14 @@ describe('falling back from the desktop to the cloud', () => {
     expect(res.structuredContent).toMatchObject({ created: ['CLOUDCOL'], target: 'cloud' });
   });
 
+  it('goes straight to the cloud when the desktop answers but takes no writes (Zotero 9)', async () => {
+    const ctx = desktopCtx({ cloud: true });
+    ctx.localWrites.acceptsWrites = vi.fn(async () => false);
+    const res = await manageCollections.handler({ action: 'create', name: 'X' }, ctx);
+    expect(ctx.localWrites.writeCollections).not.toHaveBeenCalled();
+    expect(res.structuredContent).toMatchObject({ created: ['CLOUDCOL'], target: 'cloud' });
+  });
+
   it('falls back out of a per-item loop when the very first write is refused', async () => {
     const ctx = desktopCtx({ cloud: true });
     ctx.localWrites.patchItem = vi.fn(async () => {

@@ -88,6 +88,20 @@ All notable changes to Zoteus are documented here. The format is based on
   failed for every item as an error rather than a success, as every other write tool already
   did (#77). One item missing from a membership or tag edit is now a per-item failure instead
   of aborting the call.
+- **A Zotero 9 desktop is recognised before a write, not after one.** Every desktop-first
+  write now asks the running app whether it takes local-API writes at all (the same cheap
+  probe each write starts with, cached once it succeeds) before choosing it, so on Zotero 9
+  with a cloud key an operation runs on the cloud from start to finish. That matters most for
+  `zotero_merge_items`, whose preview has to read the copy its write will act on. Zotero's
+  own answer to a write on a read-only endpoint, 400 "Endpoint does not support method" (501
+  "Method not implemented" for PATCH, PUT and DELETE), is also read as "no local writes"
+  again rather than as a rejected request.
+- **`zotero_merge_items` previews need no write access.** A dry run whose library the desktop
+  is not taking writes for, with no key or a read-only one, is a read-only preview again,
+  with a `note` saying this server cannot apply it, instead of being refused by the write
+  gate. Its check for children the desktop holds and the cloud does not yet now asks the
+  desktop itself, not the router, which answers from the cloud while a cloud write to that
+  library waits for the app to sync.
 
 ## [1.22.4] - 2026-10-01
 

@@ -137,6 +137,16 @@ describe('zotero_merge_items dry run', () => {
     expect(ctx.web.getItem).not.toHaveBeenCalled();
   });
 
+  it('previews with a read-only cloud key, since a preview only reads, and says it cannot apply', async () => {
+    const ctx = makeCtx({ capabilities: { cloud: { userID: 19552201, username: 'oscardvs', access: { user: { library: true } } }, localApi: false } });
+    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'] }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(res.structuredContent.readFrom).toBe('cloud');
+    expect(res.structuredContent.note).toMatch(/Preview only/);
+    expect(res.structuredContent.note).toMatch(/read-only|write/i);
+    expect(ctx.web.patchItem).not.toHaveBeenCalled();
+  });
+
   it('refuses when duplicate_keys names nothing but the master', async () => {
     const ctx = makeCtx();
     const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['K1'] }, ctx);
@@ -862,6 +872,50 @@ describe('zotero_merge_items on the desktop app', () => {
     expect(ctx.localWrites.writeItems).not.toHaveBeenCalled();
     expect(res.structuredContent.applied.trashed).toEqual([]);
     expect(res.structuredContent.failed.some((f: any) => /Zotero cloud lists 1 child item\(s\) on D1 that the desktop app does not have yet \(X9\)/.test(f.message))).toBe(true);
+  });
+
+  it('previews and applies on the cloud, start to finish, when the desktop has no local-API writes (Zotero 9)', async () => {
+    // Up but read-only: deciding that before the preview keeps preview and write on one copy.
+    // Deciding it only when the master PATCH fell back let a desktop preview be applied on the
+    // cloud, a different merge from the one approved.
+    const { ctx } = desktopCtx({ cloud: true });
+    ctx.router.servesLocally = vi.fn(() => true);
+    ctx.localWrites.acceptsWrites = vi.fn(async () => false);
+    const preview: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'] }, ctx);
+    expect(preview.structuredContent.readFrom).toBe('cloud');
+    // The cloud's version of the master, not the desktop's 2090.
+    expect(preview.structuredContent.versions.master).toBe(fixture().K1.version);
+    const applied: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'], dry_run: false }, ctx);
+    expect(applied.structuredContent.target).toBe('cloud');
+    expect(ctx.localWrites.patchItem).not.toHaveBeenCalled();
+    expect(ctx.web.patchItem).toHaveBeenCalled();
+  });
+
+  it('asks the desktop itself for its children while a cloud write keeps the merge on the cloud', async () => {
+    // While a cloud write to the library waits for the app to sync, the router answers reads
+    // from the cloud, so a second opinion asked through it was the cloud agreeing with itself.
+    const { ctx, items } = desktopCtx({ cloud: true });
+    ctx.router.servesLocally = vi.fn(() => true);
+    ctx.router.awaitingDesktopSync = vi.fn(async () => true);
+    items.X9 = { key: 'X9', version: 2099, data: { key: 'X9', itemType: 'attachment', parentItem: 'D1', title: 'added in the app' } };
+    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'], dry_run: false }, ctx);
+    expect(ctx.local.getItemChildren).toHaveBeenCalled();
+    expect(ctx.localWrites.patchItem).not.toHaveBeenCalled();
+    expect(res.structuredContent.applied.trashed).toEqual([]);
+    expect(res.structuredContent.failed.some((f: any) => /desktop app lists 1 child item\(s\) on D1 that the cloud copy does not have yet \(X9\)/.test(f.message))).toBe(true);
+  });
+
+  it('still previews, read-only and saying so, when the desktop serves the library but takes no writes and there is no key', async () => {
+    const { ctx } = desktopCtx();
+    ctx.router.servesLocally = vi.fn(() => true);
+    ctx.localWrites.acceptsWrites = vi.fn(async () => false);
+    const res: any = await mergeItems.handler({ master_key: 'K1', duplicate_keys: ['D1'] }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(res.structuredContent.dryRun).toBe(true);
+    expect(res.structuredContent.readFrom).toBe('local');
+    expect(res.structuredContent.note).toMatch(/^Preview only: this server cannot apply this merge\./);
+    expect(res.content[0].text).toMatch(/^Preview only/);
+    expect(ctx.localWrites.patchItem).not.toHaveBeenCalled();
   });
 
   it('merges inside a group the desktop holds, with group URIs and group-addressed writes', async () => {

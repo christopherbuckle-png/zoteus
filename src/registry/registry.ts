@@ -378,7 +378,12 @@ export function isPersonalLibrary(lib: LibraryRef): boolean {
  * client (not a hosted tenant, not `ZOTEUS_LOCAL=off`), and `writesGoToDesktop` says yes.
  */
 export async function desktopTakesWrites(ctx: ToolContext, lib: LibraryRef): Promise<boolean> {
-  return Boolean(ctx.localWrites) && (await writesGoToDesktop(ctx, lib));
+  if (!ctx.localWrites || !(await writesGoToDesktop(ctx, lib))) return false;
+  // Up is not enough: a Zotero 9 answers reads and has no write endpoint at all. Deciding
+  // that here, rather than by falling back after a refused write, keeps an operation on ONE
+  // copy from start to finish, which a merge needs: its preview must read the copy its write
+  // will act on. Optional because hand-built test contexts carry only the writes they use.
+  return (await ctx.localWrites.acceptsWrites?.()) ?? true;
 }
 
 /**
@@ -633,7 +638,8 @@ export function registerAllTools(
  * version). Callers use this to fall back to the connector protocol or the cloud Web API.
  *
  * Two shapes qualify. Zotero 9 and earlier have a GET-only local API, so write paths answer
- * "No endpoint found" (404) or 501 "Endpoint does not support method". And a 401 that
+ * "No endpoint found" (404), 400 "Endpoint does not support method" (a POST, server.js in
+ * both 9.0.6 and 10.0.6) or 501 "Method not implemented" (PUT, PATCH, DELETE). And a 401 that
  * reaches a caller at all means the grant is gone: `LocalWriteClient.request` answers the
  * first 401 by dropping its key, re-authorizing and retrying once (local-writes.ts), so a
  * 401 arriving here has already survived that. Its key is stale or was consumed and Zotero
@@ -650,6 +656,9 @@ export function registerAllTools(
 export function isLocalWritesUnavailable(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   if (/denied/i.test(msg)) return false;
+  // Zotero's own wording for a read-only endpoint, checked before the 400 rule below because
+  // a POST to one is answered with exactly that status.
+  if (/local api/i.test(msg) && /endpoint does not support method|method not implemented/i.test(msg)) return true;
   // A 400 is the desktop judging what the request asked for, which only a desktop that takes
   // writes does. Measured on 10.0.6: full text for a text/plain attachment answers 400 "Full-
   // text content is not supported for this item type", whose "not supported" sent a keyless

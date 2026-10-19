@@ -32,6 +32,17 @@ describe('isLocalWritesUnavailable', () => {
     ).toBe(false);
   });
 
+  // What Zotero 9.0.6 and 10.0.6 actually send for a write to a read-only endpoint
+  // (server.js): a POST gets 400, every other write method 501. The 400 must not be mistaken
+  // for the desktop judging the request, which is what a 400 otherwise means.
+  it("reads Zotero's own read-only-endpoint answers as unavailable, 400 included", () => {
+    expect(isLocalWritesUnavailable(new Error('Local API local write failed (400): Endpoint does not support method'))).toBe(true);
+    expect(isLocalWritesUnavailable(new Error('Local API PATCH /items/K1 failed (501): Method not implemented'))).toBe(true);
+    expect(
+      isLocalWritesUnavailable(new Error('Local API PUT /items/K/fulltext failed (400): Full-text content is not supported for this item type')),
+    ).toBe(false);
+  });
+
   it('leaves real write failures alone', () => {
     expect(isLocalWritesUnavailable(new Error('Local API 400: itemType property not provided'))).toBe(false);
     expect(isLocalWritesUnavailable(new Error('Local API 412: precondition failed'))).toBe(false);
